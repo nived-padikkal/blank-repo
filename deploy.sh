@@ -244,6 +244,17 @@ def is_http_alive(url: str) -> bool:
         return False
 
 
+def is_port_open(port: str) -> bool:
+    import socket
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(1)
+    try:
+        return sock.connect_ex(("127.0.0.1", int(port))) == 0
+    finally:
+        sock.close()
+
+
 def process_alive(proc) -> bool:
     return proc is not None and proc.poll() is None
 
@@ -274,7 +285,17 @@ def terminate_group(proc, name: str, timeout_seconds: int):
     proc.wait(timeout=5)
 
 
+def wait_for_port_close(port: str, timeout_seconds: int) -> bool:
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        if not is_port_open(port):
+            return True
+        time.sleep(0.5)
+    return not is_port_open(port)
+
+
 shutdown_started = False
+remote_stop_requested = False
 
 
 def graceful_shutdown(reason: str):
@@ -290,6 +311,8 @@ def graceful_shutdown(reason: str):
         print(f"[STOP] Failed to update server state: {exc}")
 
     terminate_group(app_proc, "application", 25)
+    if not wait_for_port_close(PORT, 10):
+        print(f"[STOP] Port {PORT} is still open after app shutdown")
     terminate_group(tunnel_proc, "cloudflared", 15)
     print("[STOP] Graceful shutdown complete")
     sys.exit(0)
@@ -353,9 +376,8 @@ def start_application():
     env["NODE_ENV"] = "production"
     print(f"[DEPLOY] Starting {PROJECT_TYPE} app: {START_CMD}")
     return subprocess.Popen(
-        START_CMD,
+        ["bash", "-lc", f"exec {START_CMD}"],
         cwd=APP_DIR,
-        shell=True,
         env=env,
         preexec_fn=os.setsid,
     )
@@ -401,9 +423,13 @@ while True:
             f"/rest/v1/servers?host_name=eq.{urllib.parse.quote(HOST_NAME, safe='')}&select=is_stopped",
         )
         if stop_rows and stop_rows[0].get("is_stopped"):
+            remote_stop_requested = True
             graceful_shutdown("remote stop requested")
     except urllib.error.URLError as exc:
         print(f"[MONITOR] Supabase poll failed: {exc}")
+
+    if shutdown_started or remote_stop_requested:
+        continue
 
     alive = is_http_alive(LOCAL_URL)
     try:
