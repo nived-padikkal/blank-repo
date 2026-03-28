@@ -193,6 +193,17 @@ def set_server_state(status: bool, is_stopped: bool, start_datetime=None):
         supa_request("POST", "/rest/v1/servers", payload)
 
 
+def update_server_heartbeat(status: bool):
+    supa_request(
+        "PATCH",
+        f"/rest/v1/servers?host_name=eq.{urllib.parse.quote(HOST_NAME, safe='')}",
+        {
+            "status": status,
+            "last_checked": now(),
+        },
+    )
+
+
 def send_webhook(start_time: str):
     payload = json.dumps({
         "host": HOST_NAME,
@@ -384,12 +395,6 @@ while True:
     if not process_alive(tunnel_proc):
         graceful_shutdown("cloudflared exited")
 
-    alive = is_http_alive(LOCAL_URL)
-    try:
-        set_server_state(status=alive, is_stopped=False)
-    except Exception as exc:
-        print(f"[HEARTBEAT] Failed to update status: {exc}")
-
     try:
         stop_rows = supa_request(
             "GET",
@@ -399,4 +404,10 @@ while True:
             graceful_shutdown("remote stop requested")
     except urllib.error.URLError as exc:
         print(f"[MONITOR] Supabase poll failed: {exc}")
+
+    alive = is_http_alive(LOCAL_URL)
+    try:
+        update_server_heartbeat(alive)
+    except Exception as exc:
+        print(f"[HEARTBEAT] Failed to update status: {exc}")
 PY
