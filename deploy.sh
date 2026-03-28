@@ -296,6 +296,7 @@ def wait_for_port_close(port: str, timeout_seconds: int) -> bool:
 
 shutdown_started = False
 remote_stop_requested = False
+full_system_shutdown_requested = False
 
 
 def graceful_shutdown(reason: str):
@@ -315,6 +316,28 @@ def graceful_shutdown(reason: str):
         print(f"[STOP] Port {PORT} is still open after app shutdown")
     terminate_group(tunnel_proc, "cloudflared", 15)
     print("[STOP] Graceful shutdown complete")
+
+    if full_system_shutdown_requested:
+        print("[STOP] Requesting full system shutdown")
+        shutdown_commands = [
+            ["sudo", "-n", "shutdown", "-h", "now"],
+            ["/sbin/shutdown", "-h", "now"],
+            ["shutdown", "-h", "now"],
+            ["systemctl", "poweroff"],
+            ["poweroff"],
+        ]
+        for cmd in shutdown_commands:
+            try:
+                subprocess.Popen(cmd)
+                print(f"[STOP] System shutdown command issued: {' '.join(cmd)}")
+                break
+            except FileNotFoundError:
+                continue
+            except Exception as exc:
+                print(f"[STOP] Shutdown command failed ({' '.join(cmd)}): {exc}")
+        else:
+            print("[STOP] No system shutdown command could be executed")
+
     sys.exit(0)
 
 
@@ -423,6 +446,7 @@ while True:
             f"/rest/v1/servers?host_name=eq.{urllib.parse.quote(HOST_NAME, safe='')}&select=is_stopped",
         )
         if stop_rows and stop_rows[0].get("is_stopped"):
+            full_system_shutdown_requested = True
             remote_stop_requested = True
             graceful_shutdown("remote stop requested")
     except urllib.error.URLError as exc:
