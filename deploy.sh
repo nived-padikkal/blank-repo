@@ -12,6 +12,8 @@ START_CMD=""
 PORT=""
 HOST_NAME=""
 REPO_URL=""
+BRANCH=""
+COMMIT=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -22,6 +24,8 @@ while [[ $# -gt 0 ]]; do
     --port)         PORT="$2"; shift 2 ;;
     --host-name)    HOST_NAME="$2"; shift 2 ;;
     --repo-url)     REPO_URL="$2"; shift 2 ;;
+    --branch)       BRANCH="$2"; shift 2 ;;
+    --commit)       COMMIT="$2"; shift 2 ;;
     *)
       echo "[ERROR] Unknown parameter: $1"
       exit 1
@@ -63,6 +67,8 @@ echo "  start     : $START_CMD"
 echo "  port      : $PORT"
 echo "  host      : $HOST_NAME"
 echo "  repo      : $REPO_URL"
+[[ -n "$BRANCH" ]] && echo "  branch    : $BRANCH"
+[[ -n "$COMMIT" ]] && echo "  commit    : $COMMIT"
 echo "=========================================="
 echo ""
 
@@ -70,8 +76,18 @@ APP_DIR="/tmp/$PROJECT_NAME"
 
 echo "[DEPLOY] Cloning $REPO_URL into $APP_DIR ..."
 rm -rf "$APP_DIR"
-git clone "$REPO_URL" "$APP_DIR"
+if [[ -n "$BRANCH" ]]; then
+  git clone --branch "$BRANCH" --single-branch "$REPO_URL" "$APP_DIR"
+else
+  git clone "$REPO_URL" "$APP_DIR"
+fi
 cd "$APP_DIR"
+
+if [[ -n "$COMMIT" ]]; then
+  echo "[DEPLOY] Checking out commit $COMMIT ..."
+  git fetch --depth 1 origin "$COMMIT" || git fetch origin "$COMMIT"
+  git checkout --detach "$COMMIT"
+fi
 
 echo "[DEPLOY] Preparing runtime for type: $PROJECT_TYPE ..."
 case "$PROJECT_TYPE" in
