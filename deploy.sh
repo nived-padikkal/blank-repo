@@ -14,6 +14,7 @@ HOST_NAME=""
 REPO_URL=""
 BRANCH=""
 COMMIT=""
+ENV_VARS_JSON="[]"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -26,6 +27,7 @@ while [[ $# -gt 0 ]]; do
     --repo-url)     REPO_URL="$2"; shift 2 ;;
     --branch)       BRANCH="$2"; shift 2 ;;
     --commit)       COMMIT="$2"; shift 2 ;;
+    --env-vars)     ENV_VARS_JSON="$2"; shift 2 ;;
     *)
       echo "[ERROR] Unknown parameter: $1"
       exit 1
@@ -69,6 +71,7 @@ echo "  host      : $HOST_NAME"
 echo "  repo      : $REPO_URL"
 [[ -n "$BRANCH" ]] && echo "  branch    : $BRANCH"
 [[ -n "$COMMIT" ]] && echo "  commit    : $COMMIT"
+[[ "$ENV_VARS_JSON" != "[]" && -n "$ENV_VARS_JSON" ]] && echo "  env vars  : configured"
 echo "=========================================="
 echo ""
 
@@ -89,6 +92,39 @@ if [[ -n "$COMMIT" ]]; then
   git checkout --detach "$COMMIT"
 fi
 
+if [[ -n "$ENV_VARS_JSON" && "$ENV_VARS_JSON" != "[]" ]]; then
+  echo "[DEPLOY] Exporting environment variables ..."
+  while IFS= read -r env_line; do
+    export "$env_line"
+  done < <(
+    ENV_VARS_JSON="$ENV_VARS_JSON" python3 - <<'PY'
+import json
+import os
+import re
+import shlex
+import sys
+
+try:
+    env_vars = json.loads(os.environ.get("ENV_VARS_JSON") or "[]")
+except json.JSONDecodeError as exc:
+    print(f"[ERROR] Invalid env vars JSON: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+for item in env_vars:
+    if not isinstance(item, dict):
+        continue
+    key = str(item.get("key") or "").strip()
+    if not key:
+        continue
+    if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", key):
+        print(f"[ERROR] Invalid environment variable name: {key}", file=sys.stderr)
+        sys.exit(1)
+    value = "" if item.get("value") is None else str(item.get("value"))
+    print(f"{key}={shlex.quote(value)}")
+PY
+  )
+fi
+
 echo "[DEPLOY] Preparing runtime for type: $PROJECT_TYPE ..."
 case "$PROJECT_TYPE" in
   python)
@@ -107,7 +143,7 @@ echo "[DEPLOY] Downloading cloudflared ..."
 wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O /tmp/cloudflared
 chmod +x /tmp/cloudflared
 
-export PROJECT_NAME PROJECT_TYPE BUILD_CMD START_CMD PORT HOST_NAME REPO_URL APP_DIR
+export PROJECT_NAME PROJECT_TYPE BUILD_CMD START_CMD PORT HOST_NAME REPO_URL APP_DIR ENV_VARS_JSON
 
 python3 - <<'PY'
 import base64
@@ -128,6 +164,7 @@ START_CMD = os.environ["START_CMD"]
 PORT = str(os.environ["PORT"])
 HOST_NAME = os.environ["HOST_NAME"]
 APP_DIR = os.environ["APP_DIR"]
+ENV_VARS_JSON = os.environ.get("ENV_VARS_JSON") or "[]"
 
 CF_TOKEN = "cfut_qs9wqP1JvcMUCpNvPGk8vCN9H5Hva95SgZcb5FAp3766f6d6"
 ZONE_ID = "d94e02b712e26c4efccb5ff046942078"
@@ -410,6 +447,17 @@ def configure_tunnel():
 
 def start_application():
     env = os.environ.copy()
+    try:
+        env_vars = json.loads(ENV_VARS_JSON)
+    except json.JSONDecodeError:
+        env_vars = []
+    for item in env_vars:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("key") or "").strip()
+        if not key:
+            continue
+        env[key] = "" if item.get("value") is None else str(item.get("value"))
     env["PORT"] = PORT
     env["HOST"] = "0.0.0.0"
     env["NODE_ENV"] = "production"
