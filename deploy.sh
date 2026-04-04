@@ -480,7 +480,7 @@ def start_tunnel():
 
 
 start_time = now()
-set_server_state(status=True, is_stopped=False, start_datetime=start_time)
+set_server_state(status=False, is_stopped=False, start_datetime=start_time)
 
 configure_tunnel()
 
@@ -488,6 +488,7 @@ app_proc = start_application()
 if not wait_for_http_ready(LOCAL_URL, 60):
     graceful_shutdown("application failed readiness check")
 
+set_server_state(status=True, is_stopped=False, start_datetime=start_time)
 print(f"[DEPLOY] Application ready on {LOCAL_URL}")
 tunnel_proc = start_tunnel()
 time.sleep(2)
