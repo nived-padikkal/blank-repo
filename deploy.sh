@@ -150,6 +150,7 @@ import base64
 import json
 import os
 import signal
+import shutil
 import subprocess
 import sys
 import time
@@ -222,11 +223,95 @@ def supa_request(method: str, path: str, data=None):
         return json.loads(raw) if raw else None
 
 
-def set_server_state(status: bool, is_stopped: bool, start_datetime=None):
+def round_metric(value):
+    if value is None:
+        return None
+    return round(float(value), 2)
+
+
+def read_cpu_times():
+    try:
+        with open("/proc/stat", "r", encoding="utf-8") as stat_file:
+            first_line = stat_file.readline().strip()
+    except OSError:
+        return None
+    if not first_line.startswith("cpu "):
+        return None
+    parts = first_line.split()[1:]
+    try:
+        values = [int(part) for part in parts]
+    except ValueError:
+        return None
+    idle = values[3] + (values[4] if len(values) > 4 else 0)
+    total = sum(values)
+    return total, idle
+
+
+previous_cpu_times = read_cpu_times()
+
+
+def read_memory_usage():
+    mem_total_kb = None
+    mem_available_kb = None
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as meminfo:
+            for line in meminfo:
+                if line.startswith("MemTotal:"):
+                    mem_total_kb = int(line.split()[1])
+                elif line.startswith("MemAvailable:"):
+                    mem_available_kb = int(line.split()[1])
+                if mem_total_kb is not None and mem_available_kb is not None:
+                    break
+    except (OSError, ValueError):
+        return None, None
+
+    if mem_total_kb is None or mem_available_kb is None:
+        return None, None
+
+    used_kb = max(mem_total_kb - mem_available_kb, 0)
+    return used_kb / (1024 * 1024), mem_total_kb / (1024 * 1024)
+
+
+def read_disk_usage():
+    try:
+        usage = shutil.disk_usage(APP_DIR if os.path.isdir(APP_DIR) else "/")
+    except OSError:
+        return None, None
+    used_gb = (usage.total - usage.free) / (1024 ** 3)
+    total_gb = usage.total / (1024 ** 3)
+    return used_gb, total_gb
+
+
+def collect_resource_usage():
+    global previous_cpu_times
+
+    cpu_percent = None
+    current_cpu_times = read_cpu_times()
+    if current_cpu_times and previous_cpu_times:
+        total_delta = current_cpu_times[0] - previous_cpu_times[0]
+        idle_delta = current_cpu_times[1] - previous_cpu_times[1]
+        if total_delta > 0:
+            cpu_percent = max(0.0, min(100.0, (1 - (idle_delta / total_delta)) * 100))
+    previous_cpu_times = current_cpu_times or previous_cpu_times
+
+    memory_used_gb, memory_total_gb = read_memory_usage()
+    disk_used_gb, disk_total_gb = read_disk_usage()
+
+    return {
+        "cpu_percent": round_metric(cpu_percent),
+        "memory_used_gb": round_metric(memory_used_gb),
+        "memory_total_gb": round_metric(memory_total_gb),
+        "disk_used_gb": round_metric(disk_used_gb),
+        "disk_total_gb": round_metric(disk_total_gb),
+    }
+
+
+def set_server_state(status: bool, is_stopped: bool, start_datetime=None, resource_usage=None):
     payload = {
         "status": status,
         "is_stopped": is_stopped,
         "last_checked": now(),
+        "resource_usage": resource_usage or collect_resource_usage(),
     }
     if start_datetime:
         payload["start_datetime"] = start_datetime
@@ -253,6 +338,7 @@ def update_server_heartbeat(status: bool):
         {
             "status": status,
             "last_checked": now(),
+            "resource_usage": collect_resource_usage(),
         },
     )
 
