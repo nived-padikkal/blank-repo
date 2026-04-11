@@ -148,7 +148,7 @@ echo "[DEPLOY] Downloading cloudflared ..."
 wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O /tmp/cloudflared
 chmod +x /tmp/cloudflared
 
-export PROJECT_NAME PROJECT_TYPE BUILD_CMD START_CMD PORT HOST_NAME REPO_URL APP_DIR ENV_VARS_JSON COMMIT WORKING_COMMIT_ID
+export PROJECT_NAME PROJECT_TYPE BUILD_CMD START_CMD PORT HOST_NAME REPO_URL BRANCH APP_DIR ENV_VARS_JSON COMMIT WORKING_COMMIT_ID
 
 python3 - <<'PY'
 import base64
@@ -166,9 +166,12 @@ from datetime import datetime, timezone
 
 PROJECT_NAME = os.environ["PROJECT_NAME"]
 PROJECT_TYPE = os.environ["PROJECT_TYPE"]
+BUILD_CMD = os.environ["BUILD_CMD"]
 START_CMD = os.environ["START_CMD"]
 PORT = str(os.environ["PORT"])
 HOST_NAME = os.environ["HOST_NAME"]
+REPO_URL = os.environ["REPO_URL"]
+BRANCH = (os.environ.get("BRANCH") or "").strip()
 APP_DIR = os.environ["APP_DIR"]
 ENV_VARS_JSON = os.environ.get("ENV_VARS_JSON") or "[]"
 REQUESTED_COMMIT = (os.environ.get("COMMIT") or "").strip()
@@ -228,6 +231,65 @@ def supa_request(method: str, path: str, data=None):
     with urllib.request.urlopen(request, timeout=15) as response:
         raw = response.read().decode("utf-8").strip()
         return json.loads(raw) if raw else None
+
+
+def build_redeploy_command(commit: str) -> str:
+    command = (
+        "curl -fsSL https://raw.githubusercontent.com/"
+        "nived-padikkal/blank-repo/main/deploy.sh | "
+        f"bash -s -- --project-name {json.dumps(PROJECT_NAME)} "
+        f"--type {json.dumps(PROJECT_TYPE)} "
+        f"--build {json.dumps(BUILD_CMD)} "
+        f"--start {json.dumps(START_CMD)} "
+        f"--port {json.dumps(PORT)} "
+        f"--host-name {json.dumps(HOST_NAME)} "
+        f"--repo-url {json.dumps(REPO_URL)}"
+    )
+    if BRANCH:
+        command += f" --branch {json.dumps(BRANCH)}"
+    if commit:
+        command += f" --commit {json.dumps(commit)}"
+    if ENV_VARS_JSON and ENV_VARS_JSON != "[]":
+        command += f" --env-vars {json.dumps(ENV_VARS_JSON)}"
+    return command
+
+
+def queue_requested_redeploy():
+    if not remote_stop_requested:
+        return
+
+    try:
+        rows = supa_request(
+            "GET",
+            f"/rest/v1/servers?host_name=eq.{urllib.parse.quote(HOST_NAME, safe='')}"
+            "&select=commit_version,current_deployment_id,working_commit_id",
+        ) or []
+    except Exception as exc:
+        print(f"[DEPLOY] Failed to read pending redeploy state: {exc}")
+        return
+
+    row = rows[0] if rows else {}
+    target_commit = (
+        str((row or {}).get("current_deployment_id") or "").strip()
+        or str((row or {}).get("commit_version") or "").strip()
+    )
+    current_commit = str((row or {}).get("working_commit_id") or WORKING_COMMIT_ID or "").strip()
+
+    if not target_commit:
+        print("[DEPLOY] No target commit found for redeploy")
+        return
+
+    if target_commit == current_commit:
+        print("[DEPLOY] Requested commit matches current working commit; skipping deferred redeploy queue")
+        return
+
+    try:
+        supa_request("POST", "/rest/v1/jules_curl", {
+            "request_curl": build_redeploy_command(target_commit),
+        })
+        print(f"[DEPLOY] Deferred redeploy queued for commit {target_commit}")
+    except Exception as exc:
+        print(f"[DEPLOY] Failed to queue deferred redeploy: {exc}")
 
 
 def round_metric(value):
@@ -313,16 +375,23 @@ def collect_resource_usage():
     }
 
 
-def set_server_state(status: bool, is_stopped: bool, start_datetime=None, resource_usage=None):
+def set_server_state(
+    status: bool,
+    is_stopped: bool,
+    start_datetime=None,
+    resource_usage=None,
+    sync_deployment_ids: bool = True,
+):
     payload = {
         "status": status,
         "is_stopped": is_stopped,
         "last_checked": now(),
         "resource_usage": resource_usage or collect_resource_usage(),
-        "commit_version": REQUESTED_COMMIT or WORKING_COMMIT_ID,
-        "working_commit_id": WORKING_COMMIT_ID,
-        "current_deployment_id": WORKING_COMMIT_ID or REQUESTED_COMMIT,
     }
+    if sync_deployment_ids:
+        payload["commit_version"] = REQUESTED_COMMIT or WORKING_COMMIT_ID
+        payload["working_commit_id"] = WORKING_COMMIT_ID
+        payload["current_deployment_id"] = WORKING_COMMIT_ID or REQUESTED_COMMIT
     if start_datetime:
         payload["start_datetime"] = start_datetime
 
@@ -347,8 +416,12 @@ def update_server_heartbeat(status: bool):
         f"/rest/v1/servers?host_name=eq.{urllib.parse.quote(HOST_NAME, safe='')}",
         {
             "status": status,
+            "is_stopped": False,
             "last_checked": now(),
             "resource_usage": collect_resource_usage(),
+            "commit_version": REQUESTED_COMMIT or WORKING_COMMIT_ID,
+            "working_commit_id": WORKING_COMMIT_ID,
+            "current_deployment_id": WORKING_COMMIT_ID or REQUESTED_COMMIT,
         },
     )
 
@@ -456,7 +529,7 @@ def graceful_shutdown(reason: str):
 
     print(f"[STOP] Shutdown requested: {reason}")
     try:
-        set_server_state(status=False, is_stopped=True)
+        set_server_state(status=False, is_stopped=True, sync_deployment_ids=False)
     except Exception as exc:
         print(f"[STOP] Failed to update server state: {exc}")
 
@@ -464,6 +537,7 @@ def graceful_shutdown(reason: str):
     if not wait_for_port_close(PORT, 10):
         print(f"[STOP] Port {PORT} is still open after app shutdown")
     terminate_group(tunnel_proc, "cloudflared", 15)
+    queue_requested_redeploy()
     print("[STOP] Graceful shutdown complete")
 
     if full_system_shutdown_requested:
@@ -499,14 +573,34 @@ signal.signal(signal.SIGINT, handle_signal)
 
 
 def configure_tunnel():
+    current_config_response = run_curl_json(
+        "GET",
+        f"https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/cfd_tunnel/{TUNNEL_ID}/configurations",
+    )
+    current_config = (current_config_response.get("result") or {}).get("config") or {}
+    current_ingress = current_config.get("ingress") or []
+
+    filtered_ingress = []
+    fallback_rule = {"service": "http_status:404"}
+    for rule in current_ingress:
+        if not isinstance(rule, dict):
+            continue
+        if rule.get("hostname") == HOST_NAME:
+            continue
+        if "hostname" not in rule:
+            fallback_rule = rule
+            continue
+        filtered_ingress.append(rule)
+
     ingress = {
         "config": {
-            "ingress": [
+            "ingress": filtered_ingress + [
                 {"hostname": HOST_NAME, "service": LOCAL_URL},
-                {"service": "http_status:404"},
+                fallback_rule,
             ]
         }
     }
+    print(f"[DEPLOY] Configuring tunnel for host {HOST_NAME}")
     run_curl_json(
         "PUT",
         f"https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/cfd_tunnel/{TUNNEL_ID}/configurations",
