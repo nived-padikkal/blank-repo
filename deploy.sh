@@ -92,6 +92,11 @@ if [[ -n "$COMMIT" ]]; then
   git checkout --detach "$COMMIT"
 fi
 
+WORKING_COMMIT_ID="$(git rev-parse HEAD 2>/dev/null || true)"
+if [[ -n "$WORKING_COMMIT_ID" ]]; then
+  echo "[DEPLOY] Working commit: $WORKING_COMMIT_ID"
+fi
+
 if [[ -n "$ENV_VARS_JSON" && "$ENV_VARS_JSON" != "[]" ]]; then
   echo "[DEPLOY] Exporting environment variables ..."
   while IFS= read -r env_line; do
@@ -143,7 +148,7 @@ echo "[DEPLOY] Downloading cloudflared ..."
 wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O /tmp/cloudflared
 chmod +x /tmp/cloudflared
 
-export PROJECT_NAME PROJECT_TYPE BUILD_CMD START_CMD PORT HOST_NAME REPO_URL APP_DIR ENV_VARS_JSON
+export PROJECT_NAME PROJECT_TYPE BUILD_CMD START_CMD PORT HOST_NAME REPO_URL APP_DIR ENV_VARS_JSON COMMIT WORKING_COMMIT_ID
 
 python3 - <<'PY'
 import base64
@@ -166,6 +171,8 @@ PORT = str(os.environ["PORT"])
 HOST_NAME = os.environ["HOST_NAME"]
 APP_DIR = os.environ["APP_DIR"]
 ENV_VARS_JSON = os.environ.get("ENV_VARS_JSON") or "[]"
+REQUESTED_COMMIT = (os.environ.get("COMMIT") or "").strip()
+WORKING_COMMIT_ID = (os.environ.get("WORKING_COMMIT_ID") or "").strip()
 
 CF_TOKEN = "cfut_qs9wqP1JvcMUCpNvPGk8vCN9H5Hva95SgZcb5FAp3766f6d6"
 ZONE_ID = "d94e02b712e26c4efccb5ff046942078"
@@ -312,6 +319,9 @@ def set_server_state(status: bool, is_stopped: bool, start_datetime=None, resour
         "is_stopped": is_stopped,
         "last_checked": now(),
         "resource_usage": resource_usage or collect_resource_usage(),
+        "commit_version": REQUESTED_COMMIT or WORKING_COMMIT_ID,
+        "working_commit_id": WORKING_COMMIT_ID,
+        "current_deployment_id": WORKING_COMMIT_ID or REQUESTED_COMMIT,
     }
     if start_datetime:
         payload["start_datetime"] = start_datetime
