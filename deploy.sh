@@ -154,7 +154,9 @@ python3 - <<'PY'
 import base64
 import json
 import os
+import re
 import signal
+import socket
 import shutil
 import subprocess
 import sys
@@ -185,6 +187,7 @@ SUPA_URL = "https://qjisublltugsblgbcxhv.supabase.co"
 SUPA_KEY = "sb_publishable_QQ8v_ORhTSTUMbYv7zc9cw_vy1eHTzq"
 WEBHOOK_URL = "https://webhook.site/a6061d53-ff8f-47da-9eb7-0b6ca13c5f8e"
 LOCAL_URL = f"http://127.0.0.1:{PORT}"
+PUBLIC_URL = f"https://{HOST_NAME}"
 
 app_proc = None
 tunnel_proc = None
@@ -205,17 +208,138 @@ def decode_tunnel_id(token: str) -> str:
 TUNNEL_ID = decode_tunnel_id(TUNNEL_TOKEN)
 
 
+def fail(message: str, details=None, exit_code: int = 1):
+    print(f"[ERROR] {message}", file=sys.stderr)
+    if details is not None:
+        if isinstance(details, (dict, list)):
+            print(json.dumps(details, indent=2), file=sys.stderr)
+        else:
+            print(str(details), file=sys.stderr)
+    sys.exit(exit_code)
+
+
 def run_curl_json(method: str, url: str, data=None):
     cmd = [
-        "curl", "-s", "-X", method, url,
+        "curl", "-sS", "-X", method, url,
         "-H", f"Authorization: Bearer {CF_TOKEN}",
         "-H", "Content-Type: application/json",
     ]
     if data is not None:
         cmd += ["--data", json.dumps(data)]
-    completed = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    try:
+        completed = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    except subprocess.CalledProcessError as exc:
+        fail(
+            f"curl request failed for {method} {url}",
+            {
+                "returncode": exc.returncode,
+                "stdout": exc.stdout,
+                "stderr": exc.stderr,
+            },
+        )
     stdout = completed.stdout.strip()
-    return json.loads(stdout) if stdout else {}
+    if not stdout:
+        return {}
+    try:
+        return json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        fail(
+            "Cloudflare API returned invalid JSON.",
+            {"error": str(exc), "raw_response": stdout},
+        )
+
+
+def run_cloudflare_api(method: str, url: str, data=None, action: str = "Cloudflare API request"):
+    response = run_curl_json(method, url, data)
+    if response.get("success") is not True:
+        fail(f"{action} failed.", response)
+    return response
+
+
+def ensure_hostname_is_valid():
+    if "://" in HOST_NAME:
+        fail("Invalid hostname. Pass only the hostname without https://", {"host_name": HOST_NAME})
+    if "/" in HOST_NAME or " " in HOST_NAME:
+        fail("Invalid hostname format.", {"host_name": HOST_NAME})
+    if not re.match(r"^(?=.{1,253}$)([A-Za-z0-9-]{1,63}\.)+[A-Za-z]{2,63}$", HOST_NAME):
+        fail("Hostname does not match a valid DNS name format.", {"host_name": HOST_NAME})
+
+
+def load_zone_details():
+    response = run_cloudflare_api(
+        "GET",
+        f"https://api.cloudflare.com/client/v4/zones/{ZONE_ID}",
+        action="Cloudflare zone lookup",
+    )
+    result = response.get("result") or {}
+    zone_name = str(result.get("name") or "").strip().lower()
+    if not zone_name:
+        fail("Cloudflare zone lookup returned no zone name.", response)
+    if not HOST_NAME.lower().endswith(f".{zone_name}") and HOST_NAME.lower() != zone_name:
+        fail(
+            "Hostname does not belong to the configured Cloudflare zone.",
+            {"host_name": HOST_NAME, "zone_name": zone_name},
+        )
+    return result
+
+
+def verify_hostname_uniqueness():
+    response = run_cloudflare_api(
+        "GET",
+        f"https://api.cloudflare.com/client/v4/zones/{ZONE_ID}/dns_records?name={HOST_NAME}&type=CNAME",
+        action="Cloudflare DNS lookup",
+    )
+    records = response.get("result") or []
+    if len(records) > 1:
+        fail("Multiple DNS records exist for the same hostname.", response)
+    if records:
+        record = records[0]
+        content = str(record.get("content") or "")
+        if content and content != f"{TUNNEL_ID}.cfargotunnel.com":
+            fail(
+                "Hostname already points to a different target.",
+                {"host_name": HOST_NAME, "existing_content": content, "expected_content": f"{TUNNEL_ID}.cfargotunnel.com"},
+            )
+    return response
+
+
+def wait_for_dns_resolution(hostname: str, timeout_seconds: int = 60) -> list[str]:
+    print(f"[DNS] Waiting for {hostname} to resolve...")
+    deadline = time.time() + timeout_seconds
+    last_error = None
+    while time.time() < deadline:
+        try:
+            resolved = sorted({item[4][0] for item in socket.getaddrinfo(hostname, None)})
+            if resolved:
+                print(f"[DNS] Resolution successful for {hostname}: {', '.join(resolved)}")
+                return resolved
+        except socket.gaierror as exc:
+            last_error = str(exc)
+        time.sleep(2)
+    fail(
+        f"DNS did not resolve for {hostname} within {timeout_seconds}s.",
+        {"host_name": hostname, "last_error": last_error},
+    )
+
+
+def wait_for_public_http_ready(url: str, timeout_seconds: int = 60) -> None:
+    print(f"[PUBLIC] Waiting for public URL {url} ...")
+    deadline = time.time() + timeout_seconds
+    last_error = None
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=10) as response:
+                status_code = getattr(response, "status", 200)
+                if 200 <= status_code < 500:
+                    print(f"[PUBLIC] Public URL is reachable: {url} (status {status_code})")
+                    return
+        except Exception as exc:
+            last_error = str(exc)
+        time.sleep(2)
+    fail(
+        f"Public URL did not become reachable within {timeout_seconds}s.",
+        {"url": url, "last_error": last_error},
+    )
 
 
 def supa_request(method: str, path: str, data=None):
@@ -573,43 +697,49 @@ signal.signal(signal.SIGINT, handle_signal)
 
 
 def configure_tunnel():
-    current_config_response = run_curl_json(
-        "GET",
-        f"https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/cfd_tunnel/{TUNNEL_ID}/configurations",
-    )
-    current_config = (current_config_response.get("result") or {}).get("config") or {}
-    current_ingress = current_config.get("ingress") or []
+    print(f"[DEPLOY] Hostname used: {HOST_NAME}")
+    print(f"[DEPLOY] Tunnel ID: {TUNNEL_ID}")
+    ensure_hostname_is_valid()
+    zone_details = load_zone_details()
+    print(f"[DEPLOY] Cloudflare zone: {zone_details.get('name')}")
+    dns_lookup_response = verify_hostname_uniqueness()
+    print(f"[DEPLOY] Existing DNS lookup response: {json.dumps(dns_lookup_response, indent=2)}")
 
-    filtered_ingress = []
-    fallback_rule = {"service": "http_status:404"}
-    for rule in current_ingress:
-        if not isinstance(rule, dict):
-            continue
-        if rule.get("hostname") == HOST_NAME:
-            continue
-        if "hostname" not in rule:
-            fallback_rule = rule
-            continue
-        filtered_ingress.append(rule)
-
-    ingress = {
+    clear_ingress_payload = {
         "config": {
-            "ingress": filtered_ingress + [
-                {"hostname": HOST_NAME, "service": LOCAL_URL},
-                fallback_rule,
+            "ingress": [
+                {"service": "http_status:404"},
             ]
         }
     }
-    print(f"[DEPLOY] Configuring tunnel for host {HOST_NAME}")
-    run_curl_json(
+    print("[DEPLOY] Clearing previous tunnel ingress configuration")
+    run_cloudflare_api(
+        "PUT",
+        f"https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/cfd_tunnel/{TUNNEL_ID}/configurations",
+        clear_ingress_payload,
+        action="Clearing Cloudflare tunnel ingress configuration",
+    )
+
+    ingress = {
+        "config": {
+            "ingress": [
+                {"hostname": HOST_NAME, "service": LOCAL_URL},
+                {"service": "http_status:404"},
+            ]
+        }
+    }
+    print(f"[DEPLOY] Setting tunnel ingress to only {HOST_NAME}")
+    run_cloudflare_api(
         "PUT",
         f"https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/cfd_tunnel/{TUNNEL_ID}/configurations",
         ingress,
+        action="Setting Cloudflare tunnel ingress configuration",
     )
 
-    dns_query = run_curl_json(
+    dns_query = run_cloudflare_api(
         "GET",
         f"https://api.cloudflare.com/client/v4/zones/{ZONE_ID}/dns_records?name={HOST_NAME}&type=CNAME",
+        action="Fetching Cloudflare DNS record",
     )
     records = dns_query.get("result") or []
     record_id = records[0]["id"] if records else None
@@ -621,18 +751,22 @@ def configure_tunnel():
         "proxied": True,
     }
     if record_id:
-        run_curl_json(
+        dns_response = run_cloudflare_api(
             "PUT",
             f"https://api.cloudflare.com/client/v4/zones/{ZONE_ID}/dns_records/{record_id}",
             cname_payload,
+            action="Updating Cloudflare DNS record",
         )
     else:
-        run_curl_json(
+        dns_response = run_cloudflare_api(
             "POST",
             f"https://api.cloudflare.com/client/v4/zones/{ZONE_ID}/dns_records",
             cname_payload,
+            action="Creating Cloudflare DNS record",
         )
-    print("[DEPLOY] Tunnel ingress and DNS configured")
+    print(f"[DEPLOY] DNS creation response: {json.dumps(dns_response, indent=2)}")
+    wait_for_dns_resolution(HOST_NAME, 60)
+    print("[DEPLOY] Tunnel ingress and DNS configured successfully")
 
 
 def start_application():
@@ -682,6 +816,10 @@ set_server_state(status=True, is_stopped=False, start_datetime=start_time)
 print(f"[DEPLOY] Application ready on {LOCAL_URL}")
 tunnel_proc = start_tunnel()
 time.sleep(2)
+if not process_alive(tunnel_proc):
+    graceful_shutdown("cloudflared failed to start")
+wait_for_public_http_ready(PUBLIC_URL, 60)
+print(f"[DEPLOY] Final public URL: {PUBLIC_URL}")
 
 while True:
     time.sleep(30)
