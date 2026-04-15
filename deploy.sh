@@ -562,6 +562,7 @@ def wait_for_port_close(port: str, timeout_seconds: int) -> bool:
 shutdown_started = False
 remote_stop_requested = False
 full_system_shutdown_requested = False
+deployment_in_progress = True
 
 
 def graceful_shutdown(reason: str):
@@ -722,6 +723,7 @@ if not wait_for_http_ready(LOCAL_URL, 60):
     graceful_shutdown("application failed readiness check")
 
 set_server_state(status=True, is_stopped=False, start_datetime=start_time)
+deployment_in_progress = False
 print(f"[DEPLOY] Application ready on {LOCAL_URL}")
 tunnel_proc = start_tunnel()
 time.sleep(2)
@@ -744,6 +746,9 @@ while True:
             f"/rest/v1/servers?host_name=eq.{urllib.parse.quote(HOST_NAME, safe='')}&select=is_stopped",
         )
         if stop_rows and stop_rows[0].get("is_stopped"):
+            if deployment_in_progress:
+                print("[MONITOR] Ignoring remote stop while deployment/build is in progress")
+                continue
             full_system_shutdown_requested = True
             remote_stop_requested = True
             graceful_shutdown("remote stop requested")
