@@ -97,6 +97,83 @@ echo ""
 
 APP_DIR="/tmp/$PROJECT_NAME"
 
+remote_stop_requested() {
+  SUPA_URL="$SUPA_URL" SUPA_KEY="$SUPA_KEY" HOST_NAME="$HOST_NAME" python3 - <<'PY'
+import json
+import os
+import sys
+import urllib.parse
+import urllib.request
+
+supa_url = (os.environ.get("SUPA_URL") or "").strip()
+supa_key = (os.environ.get("SUPA_KEY") or "").strip()
+host_name = (os.environ.get("HOST_NAME") or "").strip()
+
+if not supa_url or not supa_key or not host_name:
+    print("0")
+    sys.exit(0)
+
+url = (
+    f"{supa_url}/rest/v1/servers"
+    f"?host_name=eq.{urllib.parse.quote(host_name, safe='')}"
+    "&select=is_stopped"
+)
+request = urllib.request.Request(
+    url,
+    headers={
+        "apikey": supa_key,
+        "Authorization": f"Bearer {supa_key}",
+        "Accept": "application/json",
+    },
+)
+
+try:
+    with urllib.request.urlopen(request, timeout=5) as response:
+        rows = json.loads(response.read().decode("utf-8") or "[]")
+except Exception:
+    print("0")
+    sys.exit(0)
+
+print("1" if rows and rows[0].get("is_stopped") else "0")
+PY
+}
+
+abort_if_remote_stop_requested() {
+  local phase="${1:-deployment}"
+  if [[ "$(remote_stop_requested)" == "1" ]]; then
+    echo "[STOP] Remote stop requested during $phase"
+    exit 0
+  fi
+}
+
+run_build_with_stop_monitor() {
+  echo "[DEPLOY] Running build ..."
+  setsid bash -lc "exec $BUILD_CMD" &
+  local build_pid=$!
+  local build_status=0
+
+  while kill -0 "$build_pid" 2>/dev/null; do
+    if [[ "$(remote_stop_requested)" == "1" ]]; then
+      echo "[STOP] Remote stop requested while build is running"
+      kill -TERM -- "-$build_pid" 2>/dev/null || kill -TERM "$build_pid" 2>/dev/null || true
+      sleep 2
+      if kill -0 "$build_pid" 2>/dev/null; then
+        kill -KILL -- "-$build_pid" 2>/dev/null || kill -KILL "$build_pid" 2>/dev/null || true
+      fi
+      wait "$build_pid" || true
+      exit 0
+    fi
+    sleep 3
+  done
+
+  wait "$build_pid" || build_status=$?
+  if [[ "$build_status" -ne 0 ]]; then
+    return "$build_status"
+  fi
+}
+
+abort_if_remote_stop_requested "deployment setup"
+
 echo "[DEPLOY] Cloning $REPO_URL into $APP_DIR ..."
 rm -rf "$APP_DIR"
 if [[ -n "$BRANCH" ]]; then
@@ -106,11 +183,15 @@ else
 fi
 cd "$APP_DIR"
 
+abort_if_remote_stop_requested "repository clone"
+
 if [[ -n "$COMMIT" ]]; then
   echo "[DEPLOY] Checking out commit $COMMIT ..."
   git fetch --depth 1 origin "$COMMIT" || git fetch origin "$COMMIT"
   git checkout --detach "$COMMIT"
 fi
+
+abort_if_remote_stop_requested "git checkout"
 
 WORKING_COMMIT_ID="$(git rev-parse HEAD 2>/dev/null || true)"
 if [[ -n "$WORKING_COMMIT_ID" ]]; then
@@ -161,8 +242,9 @@ case "$PROJECT_TYPE" in
     ;;
 esac
 
-echo "[DEPLOY] Running build ..."
-eval "$BUILD_CMD"
+abort_if_remote_stop_requested "build preparation"
+run_build_with_stop_monitor
+abort_if_remote_stop_requested "build completion"
 
 echo "[DEPLOY] Downloading cloudflared ..."
 wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O /tmp/cloudflared
@@ -493,6 +575,8 @@ def send_webhook(start_time: str):
 def wait_for_http_ready(url: str, timeout_seconds: int) -> bool:
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
+        if remote_stop_is_requested():
+            graceful_shutdown("remote stop requested during startup")
         try:
             with urllib.request.urlopen(url, timeout=5):
                 return True
@@ -507,6 +591,18 @@ def is_http_alive(url: str) -> bool:
             return True
     except Exception:
         return False
+
+
+def remote_stop_is_requested() -> bool:
+    try:
+        stop_rows = supa_request(
+            "GET",
+            f"/rest/v1/servers?host_name=eq.{urllib.parse.quote(HOST_NAME, safe='')}&select=is_stopped",
+        )
+    except Exception as exc:
+        print(f"[MONITOR] Supabase poll failed: {exc}")
+        return False
+    return bool(stop_rows and stop_rows[0].get("is_stopped"))
 
 
 def is_port_open(port: str) -> bool:
@@ -716,7 +812,13 @@ def start_tunnel():
 start_time = now()
 set_server_state(status=False, is_stopped=False, start_datetime=start_time)
 
+if remote_stop_is_requested():
+    graceful_shutdown("remote stop requested before tunnel configuration")
+
 configure_tunnel()
+
+if remote_stop_is_requested():
+    graceful_shutdown("remote stop requested before application start")
 
 app_proc = start_application()
 if not wait_for_http_ready(LOCAL_URL, 60):
@@ -741,14 +843,7 @@ while True:
         graceful_shutdown("cloudflared exited")
 
     try:
-        stop_rows = supa_request(
-            "GET",
-            f"/rest/v1/servers?host_name=eq.{urllib.parse.quote(HOST_NAME, safe='')}&select=is_stopped",
-        )
-        if stop_rows and stop_rows[0].get("is_stopped"):
-            if deployment_in_progress:
-                print("[MONITOR] Ignoring remote stop while deployment/build is in progress")
-                continue
+        if remote_stop_is_requested():
             full_system_shutdown_requested = True
             remote_stop_requested = True
             graceful_shutdown("remote stop requested")
