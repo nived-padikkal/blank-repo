@@ -97,73 +97,6 @@ echo ""
 
 APP_DIR="/tmp/$PROJECT_NAME"
 
-remote_stop_requested() {
-  SUPA_URL="$SUPA_URL" SUPA_KEY="$SUPA_KEY" HOST_NAME="$HOST_NAME" python3 - <<'PY'
-import json
-import os
-import sys
-import urllib.parse
-import urllib.request
-
-supa_url = (os.environ.get("SUPA_URL") or "").strip()
-supa_key = (os.environ.get("SUPA_KEY") or "").strip()
-host_name = (os.environ.get("HOST_NAME") or "").strip()
-
-if not supa_url or not supa_key or not host_name:
-    print("0")
-    sys.exit(0)
-
-url = (
-    f"{supa_url}/rest/v1/servers"
-    f"?host_name=eq.{urllib.parse.quote(host_name, safe='')}"
-    "&select=is_stopped"
-)
-request = urllib.request.Request(
-    url,
-    headers={
-        "apikey": supa_key,
-        "Authorization": f"Bearer {supa_key}",
-        "Accept": "application/json",
-    },
-)
-
-try:
-    with urllib.request.urlopen(request, timeout=5) as response:
-        rows = json.loads(response.read().decode("utf-8") or "[]")
-except Exception:
-    print("0")
-    sys.exit(0)
-
-print("1" if rows and rows[0].get("is_stopped") else "0")
-PY
-}
-
-run_build_with_stop_monitor() {
-  echo "[DEPLOY] Running build ..."
-  setsid bash -lc "exec $BUILD_CMD" &
-  local build_pid=$!
-  local build_status=0
-
-  while kill -0 "$build_pid" 2>/dev/null; do
-    if [[ "$(remote_stop_requested)" == "1" ]]; then
-      echo "[STOP] Remote stop requested while build is running"
-      kill -TERM -- "-$build_pid" 2>/dev/null || kill -TERM "$build_pid" 2>/dev/null || true
-      sleep 2
-      if kill -0 "$build_pid" 2>/dev/null; then
-        kill -KILL -- "-$build_pid" 2>/dev/null || kill -KILL "$build_pid" 2>/dev/null || true
-      fi
-      wait "$build_pid" || true
-      exit 0
-    fi
-    sleep 3
-  done
-
-  wait "$build_pid" || build_status=$?
-  if [[ "$build_status" -ne 0 ]]; then
-    return "$build_status"
-  fi
-}
-
 echo "[DEPLOY] Cloning $REPO_URL into $APP_DIR ..."
 rm -rf "$APP_DIR"
 if [[ -n "$BRANCH" ]]; then
@@ -228,7 +161,8 @@ case "$PROJECT_TYPE" in
     ;;
 esac
 
-run_build_with_stop_monitor
+echo "[DEPLOY] Running build ..."
+eval "$BUILD_CMD"
 
 echo "[DEPLOY] Downloading cloudflared ..."
 wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O /tmp/cloudflared
@@ -393,9 +327,6 @@ def queue_requested_redeploy():
     try:
         supa_request("POST", "/rest/v1/jules_curl", {
             "request_curl": build_redeploy_command(target_commit),
-            "status": "pending",
-            "locked_by": None,
-            "locked_at": None,
         })
         print(f"[DEPLOY] Deferred redeploy queued for commit {target_commit}")
     except Exception as exc:
