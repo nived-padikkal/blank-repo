@@ -150,6 +150,135 @@ PY
   )
 fi
 
+check_remote_stop_requested() {
+  SUPA_URL="$SUPA_URL" SUPA_KEY="$SUPA_KEY" HOST_NAME="$HOST_NAME" python3 - <<'PY'
+import json
+import os
+import sys
+import urllib.parse
+import urllib.request
+
+supa_url = (os.environ.get("SUPA_URL") or "").rstrip("/")
+supa_key = os.environ.get("SUPA_KEY") or ""
+host_name = os.environ.get("HOST_NAME") or ""
+
+if not supa_url or not supa_key or not host_name:
+    sys.exit(1)
+
+request = urllib.request.Request(
+    f"{supa_url}/rest/v1/servers?host_name=eq.{urllib.parse.quote(host_name, safe='')}&select=is_stopped",
+    headers={
+        "apikey": supa_key,
+        "Authorization": f"Bearer {supa_key}",
+        "Accept": "application/json",
+    },
+    method="GET",
+)
+
+try:
+    with urllib.request.urlopen(request, timeout=10) as response:
+        rows = json.loads(response.read().decode("utf-8") or "[]")
+except Exception as exc:
+    print(f"[MONITOR] Failed to poll stop state during build: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+should_stop = bool(rows and rows[0].get("is_stopped"))
+sys.exit(0 if should_stop else 1)
+PY
+}
+
+mark_server_stopped() {
+  SUPA_URL="$SUPA_URL" SUPA_KEY="$SUPA_KEY" HOST_NAME="$HOST_NAME" python3 - <<'PY'
+import json
+import os
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+
+supa_url = (os.environ.get("SUPA_URL") or "").rstrip("/")
+supa_key = os.environ.get("SUPA_KEY") or ""
+host_name = os.environ.get("HOST_NAME") or ""
+
+if not supa_url or not supa_key or not host_name:
+    raise SystemExit(0)
+
+payload = json.dumps({
+    "status": False,
+    "is_stopped": True,
+    "last_checked": datetime.now(timezone.utc).isoformat(),
+}).encode("utf-8")
+
+request = urllib.request.Request(
+    f"{supa_url}/rest/v1/servers?host_name=eq.{urllib.parse.quote(host_name, safe='')}",
+    data=payload,
+    headers={
+        "apikey": supa_key,
+        "Authorization": f"Bearer {supa_key}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal",
+    },
+    method="PATCH",
+)
+
+try:
+    with urllib.request.urlopen(request, timeout=10):
+        pass
+except Exception as exc:
+    print(f"[STOP] Failed to persist stopped state during build shutdown: {exc}", file=sys.stderr)
+PY
+}
+
+terminate_process_group() {
+  local pid="$1"
+  local name="$2"
+  local timeout_seconds="${3:-15}"
+
+  if ! kill -0 "$pid" 2>/dev/null; then
+    return 0
+  fi
+
+  echo "[STOP] SIGTERM -> $name (pgid=$pid)"
+  kill -TERM -- "-$pid" 2>/dev/null || true
+
+  local deadline=$((SECONDS + timeout_seconds))
+  while (( SECONDS < deadline )); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      wait "$pid" 2>/dev/null || true
+      echo "[STOP] $name exited cleanly"
+      return 0
+    fi
+    sleep 1
+  done
+
+  echo "[STOP] SIGKILL -> $name (pgid=$pid)"
+  kill -KILL -- "-$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
+
+run_build_with_stop_support() {
+  if check_remote_stop_requested; then
+    echo "[STOP] Stop requested before build started"
+    mark_server_stopped
+    exit 0
+  fi
+
+  setsid bash -lc "exec $BUILD_CMD" &
+  local build_pid=$!
+
+  while kill -0 "$build_pid" 2>/dev/null; do
+    if check_remote_stop_requested; then
+      echo "[STOP] Remote stop requested during build"
+      terminate_process_group "$build_pid" "build" 20
+      mark_server_stopped
+      echo "[STOP] Build cancelled successfully"
+      exit 0
+    fi
+    sleep 2
+  done
+
+  wait "$build_pid"
+}
+
 echo "[DEPLOY] Preparing runtime for type: $PROJECT_TYPE ..."
 case "$PROJECT_TYPE" in
   python)
@@ -162,7 +291,7 @@ case "$PROJECT_TYPE" in
 esac
 
 echo "[DEPLOY] Running build ..."
-eval "$BUILD_CMD"
+run_build_with_stop_support
 
 echo "[DEPLOY] Downloading cloudflared ..."
 wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O /tmp/cloudflared
