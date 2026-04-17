@@ -409,6 +409,9 @@ def queue_requested_redeploy():
     try:
         supa_request("POST", "/rest/v1/jules_curl", {
             "request_curl": build_redeploy_command(target_commit),
+            "status": "pending",
+            "locked_by": None,
+            "locked_at": None,
         })
         print(f"[DEPLOY] Deferred redeploy queued for commit {target_commit}")
     except Exception as exc:
