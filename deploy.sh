@@ -5,6 +5,8 @@
 
 set -euo pipefail
 
+SCRIPT_VERSION="single-host-tunnel-cleanup-v2"
+
 PROJECT_NAME=""
 PROJECT_TYPE=""
 BUILD_CMD=""
@@ -83,6 +85,7 @@ echo ""
 echo "=========================================="
 echo " Deploying: $PROJECT_NAME"
 echo "=========================================="
+echo "  script    : $SCRIPT_VERSION"
 echo "  type      : $PROJECT_TYPE"
 echo "  build     : $BUILD_CMD"
 echo "  start     : $START_CMD"
@@ -248,7 +251,21 @@ def run_curl_json(method: str, url: str, data=None):
         cmd += ["--data", json.dumps(data)]
     completed = subprocess.run(cmd, capture_output=True, text=True, check=True)
     stdout = completed.stdout.strip()
-    return json.loads(stdout) if stdout else {}
+    payload = json.loads(stdout) if stdout else {}
+    if isinstance(payload, dict) and payload.get("success") is False:
+        errors = payload.get("errors") or []
+        messages = []
+        for error in errors:
+            if isinstance(error, dict):
+                code = error.get("code")
+                message = error.get("message")
+                if code or message:
+                    messages.append(f"{code}: {message}".strip())
+            elif error:
+                messages.append(str(error))
+        joined = "; ".join(messages) if messages else stdout
+        raise RuntimeError(f"Cloudflare API request failed for {method} {url}: {joined}")
+    return payload
 
 
 def supa_request(method: str, path: str, data=None):
