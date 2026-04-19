@@ -267,10 +267,8 @@ def supa_request(method: str, path: str, data=None):
 
 
 def build_redeploy_command(commit: str) -> str:
-    command = (
-        "curl -fsSL https://raw.githubusercontent.com/"
-        "nived-padikkal/blank-repo/main/deploy.sh | "
-        f"bash -s -- --project-name {json.dumps(PROJECT_NAME)} "
+    deploy_args = (
+        f"--project-name {json.dumps(PROJECT_NAME)} "
         f"--type {json.dumps(PROJECT_TYPE)} "
         f"--build {json.dumps(BUILD_CMD)} "
         f"--start {json.dumps(START_CMD)} "
@@ -279,19 +277,26 @@ def build_redeploy_command(commit: str) -> str:
         f"--repo-url {json.dumps(REPO_URL)}"
     )
     if BRANCH:
-        command += f" --branch {json.dumps(BRANCH)}"
+        deploy_args += f" --branch {json.dumps(BRANCH)}"
     if commit:
-        command += f" --commit {json.dumps(commit)}"
+        deploy_args += f" --commit {json.dumps(commit)}"
     if ENV_VARS_JSON and ENV_VARS_JSON != "[]":
-        command += f" --env-vars {json.dumps(ENV_VARS_JSON)}"
-    command += f" --cf-token {json.dumps(CF_TOKEN)}"
-    command += f" --zone-id {json.dumps(ZONE_ID)}"
-    command += f" --account-id {json.dumps(ACCOUNT_ID)}"
-    command += f" --tunnel-token {json.dumps(TUNNEL_TOKEN)}"
-    command += f" --supa-url {json.dumps(SUPA_URL)}"
-    command += f" --supa-key {json.dumps(SUPA_KEY)}"
+        deploy_args += f" --env-vars {json.dumps(ENV_VARS_JSON)}"
+    deploy_args += f" --cf-token {json.dumps(CF_TOKEN)}"
+    deploy_args += f" --zone-id {json.dumps(ZONE_ID)}"
+    deploy_args += f" --account-id {json.dumps(ACCOUNT_ID)}"
+    deploy_args += f" --tunnel-token {json.dumps(TUNNEL_TOKEN)}"
+    deploy_args += f" --supa-url {json.dumps(SUPA_URL)}"
+    deploy_args += f" --supa-key {json.dumps(SUPA_KEY)}"
     if WEBHOOK_URL:
-        command += f" --webhook-url {json.dumps(WEBHOOK_URL)}"
+        deploy_args += f" --webhook-url {json.dumps(WEBHOOK_URL)}"
+    command = (
+        "if [ -f /app/deploy.sh ]; then "
+        f"bash /app/deploy.sh {deploy_args}; "
+        "else curl -fsSL https://raw.githubusercontent.com/"
+        "nived-padikkal/blank-repo/main/deploy.sh | "
+        f"bash -s -- {deploy_args}; fi"
+    )
     return command
 
 
