@@ -624,21 +624,17 @@ def configure_tunnel():
     current_config = (current_config_response.get("result") or {}).get("config") or {}
     current_ingress = current_config.get("ingress") or []
 
-    filtered_ingress = []
     fallback_rule = {"service": "http_status:404"}
     for rule in current_ingress:
         if not isinstance(rule, dict):
             continue
-        if rule.get("hostname") == HOST_NAME:
-            continue
         if "hostname" not in rule:
             fallback_rule = rule
             continue
-        filtered_ingress.append(rule)
 
     ingress = {
         "config": {
-            "ingress": filtered_ingress + [
+            "ingress": [
                 {"hostname": HOST_NAME, "service": LOCAL_URL},
                 fallback_rule,
             ]
