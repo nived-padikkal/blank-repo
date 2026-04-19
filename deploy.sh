@@ -438,6 +438,7 @@ def set_server_state(
         payload["working_commit_id"] = WORKING_COMMIT_ID
         payload["current_deployment_id"] = WORKING_COMMIT_ID or REQUESTED_COMMIT
     payload["tunnel_id"] = ACTIVE_TUNNEL_ID or None
+    payload["tunnel_token"] = ACTIVE_TUNNEL_TOKEN or None
     if start_datetime:
         payload["start_datetime"] = start_datetime
 
@@ -471,6 +472,7 @@ def update_server_heartbeat(status: bool):
             "working_commit_id": WORKING_COMMIT_ID,
             "current_deployment_id": WORKING_COMMIT_ID or REQUESTED_COMMIT,
             "tunnel_id": ACTIVE_TUNNEL_ID or None,
+            "tunnel_token": ACTIVE_TUNNEL_TOKEN or None,
         },
     )
 
@@ -574,7 +576,7 @@ deployment_in_progress = True
 
 
 def graceful_shutdown(reason: str):
-    global shutdown_started, ACTIVE_TUNNEL_ID
+    global shutdown_started
     if shutdown_started:
         return
     shutdown_started = True
@@ -589,13 +591,6 @@ def graceful_shutdown(reason: str):
     if not wait_for_port_close(PORT, 10):
         print(f"[STOP] Port {PORT} is still open after app shutdown")
     terminate_group(tunnel_proc, "cloudflared", 15)
-    deleted_tunnel_id = ACTIVE_TUNNEL_ID
-    delete_tunnel(deleted_tunnel_id)
-    ACTIVE_TUNNEL_ID = ""
-    try:
-        supa_request("PATCH", server_filter(), {"tunnel_id": None})
-    except Exception as exc:
-        print(f"[STOP] Failed to clear tunnel id on server row: {exc}")
     queue_requested_redeploy()
     print("[STOP] Graceful shutdown complete")
 
@@ -636,6 +631,22 @@ def sanitize_tunnel_name(value: str) -> str:
     return cleaned or "deployment"
 
 
+def load_saved_tunnel() -> tuple[str, str]:
+    try:
+        rows = supa_request(
+            "GET",
+            server_filter("tunnel_id,tunnel_token"),
+        ) or []
+    except Exception as exc:
+        print(f"[DEPLOY] Failed to load saved tunnel from server row: {exc}")
+        return "", ""
+
+    row = rows[0] if rows else {}
+    tunnel_id = str((row or {}).get("tunnel_id") or "").strip()
+    tunnel_token = str((row or {}).get("tunnel_token") or "").strip()
+    return tunnel_id, tunnel_token
+
+
 def create_tunnel() -> tuple[str, str]:
     name_seed = SERVER_ID or HOST_NAME or PROJECT_NAME
     tunnel_name = sanitize_tunnel_name(f"{name_seed}-{int(time.time())}")
@@ -656,17 +667,16 @@ def create_tunnel() -> tuple[str, str]:
     return tunnel_id, tunnel_token
 
 
-def delete_tunnel(tunnel_id: str):
-    if not tunnel_id:
-        return
-    try:
-        run_curl_json(
-            "DELETE",
-            f"https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/cfd_tunnel/{tunnel_id}",
-        )
-        print(f"[DEPLOY] Deleted tunnel: {tunnel_id}")
-    except Exception as exc:
-        print(f"[DEPLOY] Failed to delete tunnel {tunnel_id}: {exc}")
+def ensure_tunnel() -> tuple[str, str]:
+    saved_tunnel_id, saved_tunnel_token = load_saved_tunnel()
+    if saved_tunnel_id and saved_tunnel_token:
+        print(f"[DEPLOY] Reusing saved tunnel: {saved_tunnel_id}")
+        return saved_tunnel_id, saved_tunnel_token
+
+    if TUNNEL_TOKEN:
+        print("[DEPLOY] Tunnel token argument was provided but saved tunnel reuse requires DB-backed tunnel_id and tunnel_token")
+
+    return create_tunnel()
 
 
 def configure_tunnel(tunnel_id: str):
@@ -769,7 +779,7 @@ def start_tunnel(tunnel_token: str):
 start_time = now()
 set_server_state(status=False, is_stopped=False, start_datetime=start_time)
 
-ACTIVE_TUNNEL_ID, ACTIVE_TUNNEL_TOKEN = create_tunnel()
+ACTIVE_TUNNEL_ID, ACTIVE_TUNNEL_TOKEN = ensure_tunnel()
 configure_tunnel(ACTIVE_TUNNEL_ID)
 
 app_proc = start_application()
