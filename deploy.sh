@@ -61,8 +61,6 @@ MISSING=""
 [[ -z "$REPO_URL" ]] && MISSING="$MISSING --repo-url"
 [[ -z "$CF_TOKEN" ]] && MISSING="$MISSING --cf-token"
 [[ -z "$ZONE_ID" ]] && MISSING="$MISSING --zone-id"
-[[ -z "$ACCOUNT_ID" ]] && MISSING="$MISSING --account-id"
-[[ -z "$TUNNEL_TOKEN" ]] && MISSING="$MISSING --tunnel-token"
 [[ -z "$SUPA_URL" ]] && MISSING="$MISSING --supa-url"
 [[ -z "$SUPA_KEY" ]] && MISSING="$MISSING --supa-key"
 
@@ -167,15 +165,10 @@ esac
 echo "[DEPLOY] Running build ..."
 eval "$BUILD_CMD"
 
-echo "[DEPLOY] Downloading cloudflared ..."
-wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O /tmp/cloudflared
-chmod +x /tmp/cloudflared
-
 export PROJECT_NAME PROJECT_TYPE BUILD_CMD START_CMD PORT HOST_NAME REPO_URL BRANCH APP_DIR ENV_VARS_JSON COMMIT WORKING_COMMIT_ID
 export CF_TOKEN ZONE_ID ACCOUNT_ID TUNNEL_TOKEN SUPA_URL SUPA_KEY WEBHOOK_URL
 
 python3 - <<'PY'
-import base64
 import json
 import os
 import signal
@@ -215,8 +208,8 @@ def require_env(name: str) -> str:
 
 CF_TOKEN = require_env("CF_TOKEN")
 ZONE_ID = require_env("ZONE_ID")
-ACCOUNT_ID = require_env("ACCOUNT_ID")
-TUNNEL_TOKEN = require_env("TUNNEL_TOKEN")
+ACCOUNT_ID = get_env("ACCOUNT_ID")
+TUNNEL_TOKEN = get_env("TUNNEL_TOKEN")
 SUPA_URL = require_env("SUPA_URL")
 SUPA_KEY = require_env("SUPA_KEY")
 WEBHOOK_URL = get_env("WEBHOOK_URL")
@@ -230,15 +223,6 @@ boot_epoch = time.time()
 
 def now():
     return datetime.now(timezone.utc).isoformat()
-
-
-def decode_tunnel_id(token: str) -> str:
-    padded = token + "=" * (-len(token) % 4)
-    decoded = json.loads(base64.b64decode(padded))
-    return decoded["t"]
-
-
-TUNNEL_ID = decode_tunnel_id(TUNNEL_TOKEN)
 
 
 def run_curl_json(method: str, url: str, data=None):
@@ -639,90 +623,50 @@ signal.signal(signal.SIGINT, handle_signal)
 
 
 def configure_tunnel():
-    current_config_response = run_curl_json(
+    trace_request = urllib.request.Request(
+        "https://www.cloudflare.com/cdn-cgi/trace",
+        method="GET",
+        headers={"User-Agent": "MHServer deploy"},
+    )
+    with urllib.request.urlopen(trace_request, timeout=10) as response:
+        trace_body = response.read().decode("utf-8", errors="replace")
+
+    public_ip = ""
+    for line in trace_body.splitlines():
+        if line.startswith("ip="):
+            public_ip = line.partition("=")[2].strip()
+            break
+
+    if not public_ip:
+        raise RuntimeError("Failed to determine the VM public IP from Cloudflare trace")
+
+    print(f"[DEPLOY] Mapping {HOST_NAME} to VM public IP {public_ip}")
+
+    existing_query = run_curl_json(
         "GET",
-        f"https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/cfd_tunnel/{TUNNEL_ID}/configurations",
+        f"https://api.cloudflare.com/client/v4/zones/{ZONE_ID}/dns_records?name={HOST_NAME}&per_page=100",
     )
-    current_config = (current_config_response.get("result") or {}).get("config") or {}
-    current_ingress = current_config.get("ingress") or []
-
-    fallback_rule = {"service": "http_status:404"}
-    for rule in current_ingress:
-        if not isinstance(rule, dict):
-            continue
-        if "hostname" not in rule:
-            fallback_rule = rule
-            continue
-
-    ingress = {
-        "config": {
-            "ingress": [
-                {"hostname": HOST_NAME, "service": LOCAL_URL},
-                fallback_rule,
-            ]
-        }
-    }
-    print(f"[DEPLOY] Writing single-host tunnel config: {HOST_NAME} -> {LOCAL_URL}")
-    run_curl_json(
-        "PUT",
-        f"https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/cfd_tunnel/{TUNNEL_ID}/configurations",
-        ingress,
-    )
-
-    applied_config_response = run_curl_json(
-        "GET",
-        f"https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/cfd_tunnel/{TUNNEL_ID}/configurations",
-    )
-    applied_config = (applied_config_response.get("result") or {}).get("config") or {}
-    applied_ingress = applied_config.get("ingress") or []
-    applied_hostnames = [
-        str(rule.get("hostname") or "").strip()
-        for rule in applied_ingress
-        if isinstance(rule, dict) and rule.get("hostname")
-    ]
-    unexpected_hostnames = [hostname for hostname in applied_hostnames if hostname != HOST_NAME]
-    if unexpected_hostnames:
-        raise RuntimeError(
-            "Tunnel config verification failed. Unexpected hostnames remain: "
-            + ", ".join(unexpected_hostnames)
-        )
-    print(f"[DEPLOY] Tunnel config verified for host {HOST_NAME}")
-
-    tunnel_dns_target = f"{TUNNEL_ID}.cfargotunnel.com"
-
-    all_dns_query = run_curl_json(
-        "GET",
-        f"https://api.cloudflare.com/client/v4/zones/{ZONE_ID}/dns_records?type=CNAME&per_page=100",
-    )
-    all_records = all_dns_query.get("result") or []
-    for record in all_records:
+    existing_records = existing_query.get("result") or []
+    record_id = None
+    for record in existing_records:
         if not isinstance(record, dict):
             continue
-        record_id = str(record.get("id") or "").strip()
-        record_name = str(record.get("name") or "").strip()
-        record_content = str(record.get("content") or "").strip().rstrip(".")
-        if (
-            record_id
-            and record_name
-            and record_name != HOST_NAME
-            and record_content == tunnel_dns_target
-        ):
-            print(f"[DEPLOY] Removing old tunnel DNS record: {record_name} -> {record_content}")
+        existing_id = str(record.get("id") or "").strip()
+        existing_type = str(record.get("type") or "").strip().upper()
+        if existing_type == "A":
+            record_id = existing_id
+            continue
+        if existing_id:
+            print(f"[DEPLOY] Removing conflicting DNS record for {HOST_NAME}: {existing_type}")
             run_curl_json(
                 "DELETE",
-                f"https://api.cloudflare.com/client/v4/zones/{ZONE_ID}/dns_records/{record_id}",
+                f"https://api.cloudflare.com/client/v4/zones/{ZONE_ID}/dns_records/{existing_id}",
             )
 
-    dns_query = run_curl_json(
-        "GET",
-        f"https://api.cloudflare.com/client/v4/zones/{ZONE_ID}/dns_records?name={HOST_NAME}&type=CNAME",
-    )
-    records = dns_query.get("result") or []
-    record_id = records[0]["id"] if records else None
-    cname_payload = {
-        "type": "CNAME",
+    a_payload = {
+        "type": "A",
         "name": HOST_NAME,
-        "content": tunnel_dns_target,
+        "content": public_ip,
         "ttl": 1,
         "proxied": True,
     }
@@ -730,15 +674,15 @@ def configure_tunnel():
         run_curl_json(
             "PUT",
             f"https://api.cloudflare.com/client/v4/zones/{ZONE_ID}/dns_records/{record_id}",
-            cname_payload,
+            a_payload,
         )
     else:
         run_curl_json(
             "POST",
             f"https://api.cloudflare.com/client/v4/zones/{ZONE_ID}/dns_records",
-            cname_payload,
+            a_payload,
         )
-    print("[DEPLOY] Tunnel ingress and DNS configured")
+    print(f"[DEPLOY] DNS configured: {HOST_NAME} -> {public_ip}")
 
 
 def start_application():
@@ -766,15 +710,6 @@ def start_application():
     )
 
 
-def start_tunnel():
-    print("[DEPLOY] Starting cloudflared tunnel")
-    return subprocess.Popen(
-        ["/tmp/cloudflared", "tunnel", "run", "--token", TUNNEL_TOKEN],
-        cwd=APP_DIR,
-        preexec_fn=os.setsid,
-    )
-
-
 start_time = now()
 set_server_state(status=False, is_stopped=False, start_datetime=start_time)
 
@@ -787,8 +722,6 @@ if not wait_for_http_ready(LOCAL_URL, 60):
 set_server_state(status=True, is_stopped=False, start_datetime=start_time)
 deployment_in_progress = False
 print(f"[DEPLOY] Application ready on {LOCAL_URL}")
-tunnel_proc = start_tunnel()
-time.sleep(2)
 
 while True:
     time.sleep(30)
@@ -799,8 +732,6 @@ while True:
 
     if not process_alive(app_proc):
         graceful_shutdown("application exited")
-    if not process_alive(tunnel_proc):
-        graceful_shutdown("cloudflared exited")
 
     try:
         stop_rows = supa_request(
