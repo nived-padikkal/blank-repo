@@ -5,6 +5,8 @@
 
 set -euo pipefail
 
+SCRIPT_VERSION="per-deploy-tunnel-v1"
+
 PROJECT_NAME=""
 PROJECT_TYPE=""
 BUILD_CMD=""
@@ -60,7 +62,6 @@ MISSING=""
 [[ -z "$CF_TOKEN" ]] && MISSING="$MISSING --cf-token"
 [[ -z "$ZONE_ID" ]] && MISSING="$MISSING --zone-id"
 [[ -z "$ACCOUNT_ID" ]] && MISSING="$MISSING --account-id"
-[[ -z "$TUNNEL_TOKEN" ]] && MISSING="$MISSING --tunnel-token"
 [[ -z "$SUPA_URL" ]] && MISSING="$MISSING --supa-url"
 [[ -z "$SUPA_KEY" ]] && MISSING="$MISSING --supa-key"
 
@@ -83,6 +84,7 @@ echo ""
 echo "=========================================="
 echo " Deploying: $PROJECT_NAME"
 echo "=========================================="
+echo "  script    : $SCRIPT_VERSION"
 echo "  type      : $PROJECT_TYPE"
 echo "  build     : $BUILD_CMD"
 echo "  start     : $START_CMD"
@@ -172,9 +174,9 @@ export PROJECT_NAME PROJECT_TYPE BUILD_CMD START_CMD PORT HOST_NAME REPO_URL BRA
 export CF_TOKEN ZONE_ID ACCOUNT_ID TUNNEL_TOKEN SUPA_URL SUPA_KEY WEBHOOK_URL
 
 python3 - <<'PY'
-import base64
 import json
 import os
+import re
 import signal
 import shutil
 import subprocess
@@ -213,7 +215,7 @@ def require_env(name: str) -> str:
 CF_TOKEN = require_env("CF_TOKEN")
 ZONE_ID = require_env("ZONE_ID")
 ACCOUNT_ID = require_env("ACCOUNT_ID")
-TUNNEL_TOKEN = require_env("TUNNEL_TOKEN")
+TUNNEL_TOKEN = get_env("TUNNEL_TOKEN")
 SUPA_URL = require_env("SUPA_URL")
 SUPA_KEY = require_env("SUPA_KEY")
 WEBHOOK_URL = get_env("WEBHOOK_URL")
@@ -223,19 +225,12 @@ app_proc = None
 tunnel_proc = None
 webhook_sent = False
 boot_epoch = time.time()
+ACTIVE_TUNNEL_ID = ""
+ACTIVE_TUNNEL_TOKEN = ""
 
 
 def now():
     return datetime.now(timezone.utc).isoformat()
-
-
-def decode_tunnel_id(token: str) -> str:
-    padded = token + "=" * (-len(token) % 4)
-    decoded = json.loads(base64.b64decode(padded))
-    return decoded["t"]
-
-
-TUNNEL_ID = decode_tunnel_id(TUNNEL_TOKEN)
 
 
 def run_curl_json(method: str, url: str, data=None):
@@ -287,7 +282,6 @@ def build_redeploy_command(commit: str) -> str:
     command += f" --cf-token {json.dumps(CF_TOKEN)}"
     command += f" --zone-id {json.dumps(ZONE_ID)}"
     command += f" --account-id {json.dumps(ACCOUNT_ID)}"
-    command += f" --tunnel-token {json.dumps(TUNNEL_TOKEN)}"
     command += f" --supa-url {json.dumps(SUPA_URL)}"
     command += f" --supa-key {json.dumps(SUPA_KEY)}"
     if WEBHOOK_URL:
@@ -581,6 +575,7 @@ def graceful_shutdown(reason: str):
     if not wait_for_port_close(PORT, 10):
         print(f"[STOP] Port {PORT} is still open after app shutdown")
     terminate_group(tunnel_proc, "cloudflared", 15)
+    delete_tunnel(ACTIVE_TUNNEL_ID)
     queue_requested_redeploy()
     print("[STOP] Graceful shutdown complete")
 
@@ -616,40 +611,77 @@ signal.signal(signal.SIGTERM, handle_signal)
 signal.signal(signal.SIGINT, handle_signal)
 
 
-def configure_tunnel():
-    current_config_response = run_curl_json(
-        "GET",
-        f"https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/cfd_tunnel/{TUNNEL_ID}/configurations",
+def sanitize_tunnel_name(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", value or "").strip("-")
+    return cleaned or "deployment"
+
+
+def create_tunnel() -> tuple[str, str]:
+    tunnel_name = sanitize_tunnel_name(f"{PROJECT_NAME}-{HOST_NAME}-{int(time.time())}")
+    response = run_curl_json(
+        "POST",
+        f"https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/cfd_tunnel",
+        {
+            "name": tunnel_name,
+            "config_src": "cloudflare",
+        },
     )
-    current_config = (current_config_response.get("result") or {}).get("config") or {}
-    current_ingress = current_config.get("ingress") or []
+    result = response.get("result") or {}
+    tunnel_id = str(result.get("id") or "").strip()
+    tunnel_token = str(result.get("token") or "").strip()
+    if not tunnel_id or not tunnel_token:
+        raise RuntimeError("Cloudflare did not return a tunnel id/token for the new deployment tunnel")
+    print(f"[DEPLOY] Created dedicated tunnel: {tunnel_id}")
+    return tunnel_id, tunnel_token
 
-    filtered_ingress = []
-    fallback_rule = {"service": "http_status:404"}
-    for rule in current_ingress:
-        if not isinstance(rule, dict):
-            continue
-        if rule.get("hostname") == HOST_NAME:
-            continue
-        if "hostname" not in rule:
-            fallback_rule = rule
-            continue
-        filtered_ingress.append(rule)
 
+def delete_tunnel(tunnel_id: str):
+    if not tunnel_id:
+        return
+    try:
+        run_curl_json(
+            "DELETE",
+            f"https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/cfd_tunnel/{tunnel_id}",
+        )
+        print(f"[DEPLOY] Deleted tunnel: {tunnel_id}")
+    except Exception as exc:
+        print(f"[DEPLOY] Failed to delete tunnel {tunnel_id}: {exc}")
+
+
+def configure_tunnel(tunnel_id: str):
     ingress = {
         "config": {
-            "ingress": filtered_ingress + [
+            "ingress": [
                 {"hostname": HOST_NAME, "service": LOCAL_URL},
-                fallback_rule,
+                {"service": "http_status:404"},
             ]
         }
     }
-    print(f"[DEPLOY] Configuring tunnel for host {HOST_NAME}")
+    print(f"[DEPLOY] Configuring dedicated tunnel for host {HOST_NAME}")
     run_curl_json(
         "PUT",
-        f"https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/cfd_tunnel/{TUNNEL_ID}/configurations",
+        f"https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/cfd_tunnel/{tunnel_id}/configurations",
         ingress,
     )
+
+    applied_config_response = run_curl_json(
+        "GET",
+        f"https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/cfd_tunnel/{tunnel_id}/configurations",
+    )
+    applied_config = (applied_config_response.get("result") or {}).get("config") or {}
+    applied_ingress = applied_config.get("ingress") or []
+    applied_hostnames = [
+        str(rule.get("hostname") or "").strip()
+        for rule in applied_ingress
+        if isinstance(rule, dict) and rule.get("hostname")
+    ]
+    unexpected_hostnames = [hostname for hostname in applied_hostnames if hostname != HOST_NAME]
+    if unexpected_hostnames:
+        raise RuntimeError(
+            "Tunnel config verification failed. Unexpected hostnames remain: "
+            + ", ".join(unexpected_hostnames)
+        )
+    print(f"[DEPLOY] Tunnel config verified for host {HOST_NAME}")
 
     dns_query = run_curl_json(
         "GET",
@@ -660,7 +692,7 @@ def configure_tunnel():
     cname_payload = {
         "type": "CNAME",
         "name": HOST_NAME,
-        "content": f"{TUNNEL_ID}.cfargotunnel.com",
+        "content": f"{tunnel_id}.cfargotunnel.com",
         "ttl": 1,
         "proxied": True,
     }
@@ -704,10 +736,10 @@ def start_application():
     )
 
 
-def start_tunnel():
+def start_tunnel(tunnel_token: str):
     print("[DEPLOY] Starting cloudflared tunnel")
     return subprocess.Popen(
-        ["/tmp/cloudflared", "tunnel", "run", "--token", TUNNEL_TOKEN],
+        ["/tmp/cloudflared", "tunnel", "run", "--token", tunnel_token],
         cwd=APP_DIR,
         preexec_fn=os.setsid,
     )
@@ -716,7 +748,8 @@ def start_tunnel():
 start_time = now()
 set_server_state(status=False, is_stopped=False, start_datetime=start_time)
 
-configure_tunnel()
+ACTIVE_TUNNEL_ID, ACTIVE_TUNNEL_TOKEN = create_tunnel()
+configure_tunnel(ACTIVE_TUNNEL_ID)
 
 app_proc = start_application()
 if not wait_for_http_ready(LOCAL_URL, 60):
@@ -725,7 +758,7 @@ if not wait_for_http_ready(LOCAL_URL, 60):
 set_server_state(status=True, is_stopped=False, start_datetime=start_time)
 deployment_in_progress = False
 print(f"[DEPLOY] Application ready on {LOCAL_URL}")
-tunnel_proc = start_tunnel()
+tunnel_proc = start_tunnel(ACTIVE_TUNNEL_TOKEN)
 time.sleep(2)
 
 while True:
