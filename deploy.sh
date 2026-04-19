@@ -13,6 +13,7 @@ BUILD_CMD=""
 START_CMD=""
 PORT=""
 HOST_NAME=""
+SERVER_ID=""
 REPO_URL=""
 BRANCH=""
 COMMIT=""
@@ -33,6 +34,7 @@ while [[ $# -gt 0 ]]; do
     --start)        START_CMD="$2"; shift 2 ;;
     --port)         PORT="$2"; shift 2 ;;
     --host-name)    HOST_NAME="$2"; shift 2 ;;
+    --server-id)    SERVER_ID="$2"; shift 2 ;;
     --repo-url)     REPO_URL="$2"; shift 2 ;;
     --branch)       BRANCH="$2"; shift 2 ;;
     --commit)       COMMIT="$2"; shift 2 ;;
@@ -170,7 +172,7 @@ echo "[DEPLOY] Downloading cloudflared ..."
 wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O /tmp/cloudflared
 chmod +x /tmp/cloudflared
 
-export PROJECT_NAME PROJECT_TYPE BUILD_CMD START_CMD PORT HOST_NAME REPO_URL BRANCH APP_DIR ENV_VARS_JSON COMMIT WORKING_COMMIT_ID
+export PROJECT_NAME PROJECT_TYPE BUILD_CMD START_CMD PORT HOST_NAME SERVER_ID REPO_URL BRANCH APP_DIR ENV_VARS_JSON COMMIT WORKING_COMMIT_ID
 export CF_TOKEN ZONE_ID ACCOUNT_ID TUNNEL_TOKEN SUPA_URL SUPA_KEY WEBHOOK_URL
 
 python3 - <<'PY'
@@ -193,6 +195,7 @@ BUILD_CMD = os.environ["BUILD_CMD"]
 START_CMD = os.environ["START_CMD"]
 PORT = str(os.environ["PORT"])
 HOST_NAME = os.environ["HOST_NAME"]
+SERVER_ID = (os.environ.get("SERVER_ID") or "").strip()
 REPO_URL = os.environ["REPO_URL"]
 BRANCH = (os.environ.get("BRANCH") or "").strip()
 APP_DIR = os.environ["APP_DIR"]
@@ -273,6 +276,8 @@ def build_redeploy_command(commit: str) -> str:
         f"--host-name {json.dumps(HOST_NAME)} "
         f"--repo-url {json.dumps(REPO_URL)}"
     )
+    if SERVER_ID:
+        command += f" --server-id {json.dumps(SERVER_ID)}"
     if BRANCH:
         command += f" --branch {json.dumps(BRANCH)}"
     if commit:
@@ -296,8 +301,7 @@ def queue_requested_redeploy():
     try:
         rows = supa_request(
             "GET",
-            f"/rest/v1/servers?host_name=eq.{urllib.parse.quote(HOST_NAME, safe='')}"
-            "&select=commit_version,current_deployment_id,working_commit_id",
+            server_filter("commit_version,current_deployment_id,working_commit_id"),
         ) or []
     except Exception as exc:
         print(f"[DEPLOY] Failed to read pending redeploy state: {exc}")
@@ -325,6 +329,12 @@ def queue_requested_redeploy():
         print(f"[DEPLOY] Deferred redeploy queued for commit {target_commit}")
     except Exception as exc:
         print(f"[DEPLOY] Failed to queue deferred redeploy: {exc}")
+
+
+def server_filter(select_clause: str = "*") -> str:
+    if SERVER_ID:
+        return f"/rest/v1/servers?id=eq.{urllib.parse.quote(SERVER_ID, safe='')}&select={select_clause}"
+    return f"/rest/v1/servers?host_name=eq.{urllib.parse.quote(HOST_NAME, safe='')}&select={select_clause}"
 
 
 def round_metric(value):
@@ -427,28 +437,31 @@ def set_server_state(
         payload["commit_version"] = REQUESTED_COMMIT or WORKING_COMMIT_ID
         payload["working_commit_id"] = WORKING_COMMIT_ID
         payload["current_deployment_id"] = WORKING_COMMIT_ID or REQUESTED_COMMIT
+    payload["tunnel_id"] = ACTIVE_TUNNEL_ID or None
     if start_datetime:
         payload["start_datetime"] = start_datetime
 
     existing = supa_request(
         "GET",
-        f"/rest/v1/servers?host_name=eq.{urllib.parse.quote(HOST_NAME, safe='')}&select=host_name",
+        server_filter("id,host_name"),
     )
     if existing:
         supa_request(
             "PATCH",
-            f"/rest/v1/servers?host_name=eq.{urllib.parse.quote(HOST_NAME, safe='')}",
+            server_filter(),
             payload,
         )
     else:
         payload["host_name"] = HOST_NAME
+        if SERVER_ID:
+            payload["id"] = SERVER_ID
         supa_request("POST", "/rest/v1/servers", payload)
 
 
 def update_server_heartbeat(status: bool):
     supa_request(
         "PATCH",
-        f"/rest/v1/servers?host_name=eq.{urllib.parse.quote(HOST_NAME, safe='')}",
+        server_filter(),
         {
             "status": status,
             "is_stopped": False,
@@ -457,6 +470,7 @@ def update_server_heartbeat(status: bool):
             "commit_version": REQUESTED_COMMIT or WORKING_COMMIT_ID,
             "working_commit_id": WORKING_COMMIT_ID,
             "current_deployment_id": WORKING_COMMIT_ID or REQUESTED_COMMIT,
+            "tunnel_id": ACTIVE_TUNNEL_ID or None,
         },
     )
 
@@ -560,7 +574,7 @@ deployment_in_progress = True
 
 
 def graceful_shutdown(reason: str):
-    global shutdown_started
+    global shutdown_started, ACTIVE_TUNNEL_ID
     if shutdown_started:
         return
     shutdown_started = True
@@ -575,7 +589,13 @@ def graceful_shutdown(reason: str):
     if not wait_for_port_close(PORT, 10):
         print(f"[STOP] Port {PORT} is still open after app shutdown")
     terminate_group(tunnel_proc, "cloudflared", 15)
-    delete_tunnel(ACTIVE_TUNNEL_ID)
+    deleted_tunnel_id = ACTIVE_TUNNEL_ID
+    delete_tunnel(deleted_tunnel_id)
+    ACTIVE_TUNNEL_ID = ""
+    try:
+        supa_request("PATCH", server_filter(), {"tunnel_id": None})
+    except Exception as exc:
+        print(f"[STOP] Failed to clear tunnel id on server row: {exc}")
     queue_requested_redeploy()
     print("[STOP] Graceful shutdown complete")
 
@@ -617,7 +637,8 @@ def sanitize_tunnel_name(value: str) -> str:
 
 
 def create_tunnel() -> tuple[str, str]:
-    tunnel_name = sanitize_tunnel_name(f"{PROJECT_NAME}-{HOST_NAME}-{int(time.time())}")
+    name_seed = SERVER_ID or HOST_NAME or PROJECT_NAME
+    tunnel_name = sanitize_tunnel_name(f"{name_seed}-{int(time.time())}")
     response = run_curl_json(
         "POST",
         f"https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/cfd_tunnel",
@@ -776,7 +797,7 @@ while True:
     try:
         stop_rows = supa_request(
             "GET",
-            f"/rest/v1/servers?host_name=eq.{urllib.parse.quote(HOST_NAME, safe='')}&select=is_stopped",
+            server_filter("is_stopped"),
         )
         if stop_rows and stop_rows[0].get("is_stopped"):
             if deployment_in_progress:
