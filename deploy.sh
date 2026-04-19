@@ -640,12 +640,31 @@ def configure_tunnel():
             ]
         }
     }
-    print(f"[DEPLOY] Configuring tunnel for host {HOST_NAME}")
+    print(f"[DEPLOY] Writing single-host tunnel config: {HOST_NAME} -> {LOCAL_URL}")
     run_curl_json(
         "PUT",
         f"https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/cfd_tunnel/{TUNNEL_ID}/configurations",
         ingress,
     )
+
+    applied_config_response = run_curl_json(
+        "GET",
+        f"https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/cfd_tunnel/{TUNNEL_ID}/configurations",
+    )
+    applied_config = (applied_config_response.get("result") or {}).get("config") or {}
+    applied_ingress = applied_config.get("ingress") or []
+    applied_hostnames = [
+        str(rule.get("hostname") or "").strip()
+        for rule in applied_ingress
+        if isinstance(rule, dict) and rule.get("hostname")
+    ]
+    unexpected_hostnames = [hostname for hostname in applied_hostnames if hostname != HOST_NAME]
+    if unexpected_hostnames:
+        raise RuntimeError(
+            "Tunnel config verification failed. Unexpected hostnames remain: "
+            + ", ".join(unexpected_hostnames)
+        )
+    print(f"[DEPLOY] Tunnel config verified for host {HOST_NAME}")
 
     dns_query = run_curl_json(
         "GET",
