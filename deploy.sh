@@ -671,6 +671,31 @@ def configure_tunnel():
         )
     print(f"[DEPLOY] Tunnel config verified for host {HOST_NAME}")
 
+    tunnel_dns_target = f"{TUNNEL_ID}.cfargotunnel.com"
+
+    all_dns_query = run_curl_json(
+        "GET",
+        f"https://api.cloudflare.com/client/v4/zones/{ZONE_ID}/dns_records?type=CNAME&per_page=100",
+    )
+    all_records = all_dns_query.get("result") or []
+    for record in all_records:
+        if not isinstance(record, dict):
+            continue
+        record_id = str(record.get("id") or "").strip()
+        record_name = str(record.get("name") or "").strip()
+        record_content = str(record.get("content") or "").strip().rstrip(".")
+        if (
+            record_id
+            and record_name
+            and record_name != HOST_NAME
+            and record_content == tunnel_dns_target
+        ):
+            print(f"[DEPLOY] Removing old tunnel DNS record: {record_name} -> {record_content}")
+            run_curl_json(
+                "DELETE",
+                f"https://api.cloudflare.com/client/v4/zones/{ZONE_ID}/dns_records/{record_id}",
+            )
+
     dns_query = run_curl_json(
         "GET",
         f"https://api.cloudflare.com/client/v4/zones/{ZONE_ID}/dns_records?name={HOST_NAME}&type=CNAME",
@@ -680,7 +705,7 @@ def configure_tunnel():
     cname_payload = {
         "type": "CNAME",
         "name": HOST_NAME,
-        "content": f"{TUNNEL_ID}.cfargotunnel.com",
+        "content": tunnel_dns_target,
         "ttl": 1,
         "proxied": True,
     }
