@@ -5,8 +5,6 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="single-host-tunnel-cleanup-v2"
-
 PROJECT_NAME=""
 PROJECT_TYPE=""
 BUILD_CMD=""
@@ -61,6 +59,8 @@ MISSING=""
 [[ -z "$REPO_URL" ]] && MISSING="$MISSING --repo-url"
 [[ -z "$CF_TOKEN" ]] && MISSING="$MISSING --cf-token"
 [[ -z "$ZONE_ID" ]] && MISSING="$MISSING --zone-id"
+[[ -z "$ACCOUNT_ID" ]] && MISSING="$MISSING --account-id"
+[[ -z "$TUNNEL_TOKEN" ]] && MISSING="$MISSING --tunnel-token"
 [[ -z "$SUPA_URL" ]] && MISSING="$MISSING --supa-url"
 [[ -z "$SUPA_KEY" ]] && MISSING="$MISSING --supa-key"
 
@@ -83,7 +83,6 @@ echo ""
 echo "=========================================="
 echo " Deploying: $PROJECT_NAME"
 echo "=========================================="
-echo "  script    : $SCRIPT_VERSION"
 echo "  type      : $PROJECT_TYPE"
 echo "  build     : $BUILD_CMD"
 echo "  start     : $START_CMD"
@@ -165,10 +164,15 @@ esac
 echo "[DEPLOY] Running build ..."
 eval "$BUILD_CMD"
 
+echo "[DEPLOY] Downloading cloudflared ..."
+wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O /tmp/cloudflared
+chmod +x /tmp/cloudflared
+
 export PROJECT_NAME PROJECT_TYPE BUILD_CMD START_CMD PORT HOST_NAME REPO_URL BRANCH APP_DIR ENV_VARS_JSON COMMIT WORKING_COMMIT_ID
 export CF_TOKEN ZONE_ID ACCOUNT_ID TUNNEL_TOKEN SUPA_URL SUPA_KEY WEBHOOK_URL
 
 python3 - <<'PY'
+import base64
 import json
 import os
 import signal
@@ -208,8 +212,8 @@ def require_env(name: str) -> str:
 
 CF_TOKEN = require_env("CF_TOKEN")
 ZONE_ID = require_env("ZONE_ID")
-ACCOUNT_ID = get_env("ACCOUNT_ID")
-TUNNEL_TOKEN = get_env("TUNNEL_TOKEN")
+ACCOUNT_ID = require_env("ACCOUNT_ID")
+TUNNEL_TOKEN = require_env("TUNNEL_TOKEN")
 SUPA_URL = require_env("SUPA_URL")
 SUPA_KEY = require_env("SUPA_KEY")
 WEBHOOK_URL = get_env("WEBHOOK_URL")
@@ -225,6 +229,15 @@ def now():
     return datetime.now(timezone.utc).isoformat()
 
 
+def decode_tunnel_id(token: str) -> str:
+    padded = token + "=" * (-len(token) % 4)
+    decoded = json.loads(base64.b64decode(padded))
+    return decoded["t"]
+
+
+TUNNEL_ID = decode_tunnel_id(TUNNEL_TOKEN)
+
+
 def run_curl_json(method: str, url: str, data=None):
     cmd = [
         "curl", "-s", "-X", method, url,
@@ -235,21 +248,7 @@ def run_curl_json(method: str, url: str, data=None):
         cmd += ["--data", json.dumps(data)]
     completed = subprocess.run(cmd, capture_output=True, text=True, check=True)
     stdout = completed.stdout.strip()
-    payload = json.loads(stdout) if stdout else {}
-    if isinstance(payload, dict) and payload.get("success") is False:
-        errors = payload.get("errors") or []
-        messages = []
-        for error in errors:
-            if isinstance(error, dict):
-                code = error.get("code")
-                message = error.get("message")
-                if code or message:
-                    messages.append(f"{code}: {message}".strip())
-            elif error:
-                messages.append(str(error))
-        joined = "; ".join(messages) if messages else stdout
-        raise RuntimeError(f"Cloudflare API request failed for {method} {url}: {joined}")
-    return payload
+    return json.loads(stdout) if stdout else {}
 
 
 def supa_request(method: str, path: str, data=None):
@@ -268,8 +267,10 @@ def supa_request(method: str, path: str, data=None):
 
 
 def build_redeploy_command(commit: str) -> str:
-    deploy_args = (
-        f"--project-name {json.dumps(PROJECT_NAME)} "
+    command = (
+        "curl -fsSL https://raw.githubusercontent.com/"
+        "nived-padikkal/blank-repo/main/deploy.sh | "
+        f"bash -s -- --project-name {json.dumps(PROJECT_NAME)} "
         f"--type {json.dumps(PROJECT_TYPE)} "
         f"--build {json.dumps(BUILD_CMD)} "
         f"--start {json.dumps(START_CMD)} "
@@ -278,26 +279,19 @@ def build_redeploy_command(commit: str) -> str:
         f"--repo-url {json.dumps(REPO_URL)}"
     )
     if BRANCH:
-        deploy_args += f" --branch {json.dumps(BRANCH)}"
+        command += f" --branch {json.dumps(BRANCH)}"
     if commit:
-        deploy_args += f" --commit {json.dumps(commit)}"
+        command += f" --commit {json.dumps(commit)}"
     if ENV_VARS_JSON and ENV_VARS_JSON != "[]":
-        deploy_args += f" --env-vars {json.dumps(ENV_VARS_JSON)}"
-    deploy_args += f" --cf-token {json.dumps(CF_TOKEN)}"
-    deploy_args += f" --zone-id {json.dumps(ZONE_ID)}"
-    deploy_args += f" --account-id {json.dumps(ACCOUNT_ID)}"
-    deploy_args += f" --tunnel-token {json.dumps(TUNNEL_TOKEN)}"
-    deploy_args += f" --supa-url {json.dumps(SUPA_URL)}"
-    deploy_args += f" --supa-key {json.dumps(SUPA_KEY)}"
+        command += f" --env-vars {json.dumps(ENV_VARS_JSON)}"
+    command += f" --cf-token {json.dumps(CF_TOKEN)}"
+    command += f" --zone-id {json.dumps(ZONE_ID)}"
+    command += f" --account-id {json.dumps(ACCOUNT_ID)}"
+    command += f" --tunnel-token {json.dumps(TUNNEL_TOKEN)}"
+    command += f" --supa-url {json.dumps(SUPA_URL)}"
+    command += f" --supa-key {json.dumps(SUPA_KEY)}"
     if WEBHOOK_URL:
-        deploy_args += f" --webhook-url {json.dumps(WEBHOOK_URL)}"
-    command = (
-        "if [ -f /app/deploy.sh ]; then "
-        f"bash /app/deploy.sh {deploy_args}; "
-        "else curl -fsSL https://raw.githubusercontent.com/"
-        "nived-padikkal/blank-repo/main/deploy.sh | "
-        f"bash -s -- {deploy_args}; fi"
-    )
+        command += f" --webhook-url {json.dumps(WEBHOOK_URL)}"
     return command
 
 
@@ -623,50 +617,50 @@ signal.signal(signal.SIGINT, handle_signal)
 
 
 def configure_tunnel():
-    trace_request = urllib.request.Request(
-        "https://www.cloudflare.com/cdn-cgi/trace",
-        method="GET",
-        headers={"User-Agent": "MHServer deploy"},
-    )
-    with urllib.request.urlopen(trace_request, timeout=10) as response:
-        trace_body = response.read().decode("utf-8", errors="replace")
-
-    public_ip = ""
-    for line in trace_body.splitlines():
-        if line.startswith("ip="):
-            public_ip = line.partition("=")[2].strip()
-            break
-
-    if not public_ip:
-        raise RuntimeError("Failed to determine the VM public IP from Cloudflare trace")
-
-    print(f"[DEPLOY] Mapping {HOST_NAME} to VM public IP {public_ip}")
-
-    existing_query = run_curl_json(
+    current_config_response = run_curl_json(
         "GET",
-        f"https://api.cloudflare.com/client/v4/zones/{ZONE_ID}/dns_records?name={HOST_NAME}&per_page=100",
+        f"https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/cfd_tunnel/{TUNNEL_ID}/configurations",
     )
-    existing_records = existing_query.get("result") or []
-    record_id = None
-    for record in existing_records:
-        if not isinstance(record, dict):
-            continue
-        existing_id = str(record.get("id") or "").strip()
-        existing_type = str(record.get("type") or "").strip().upper()
-        if existing_type == "A":
-            record_id = existing_id
-            continue
-        if existing_id:
-            print(f"[DEPLOY] Removing conflicting DNS record for {HOST_NAME}: {existing_type}")
-            run_curl_json(
-                "DELETE",
-                f"https://api.cloudflare.com/client/v4/zones/{ZONE_ID}/dns_records/{existing_id}",
-            )
+    current_config = (current_config_response.get("result") or {}).get("config") or {}
+    current_ingress = current_config.get("ingress") or []
 
-    a_payload = {
-        "type": "A",
+    filtered_ingress = []
+    fallback_rule = {"service": "http_status:404"}
+    for rule in current_ingress:
+        if not isinstance(rule, dict):
+            continue
+        if rule.get("hostname") == HOST_NAME:
+            continue
+        if "hostname" not in rule:
+            fallback_rule = rule
+            continue
+        filtered_ingress.append(rule)
+
+    ingress = {
+        "config": {
+            "ingress": filtered_ingress + [
+                {"hostname": HOST_NAME, "service": LOCAL_URL},
+                fallback_rule,
+            ]
+        }
+    }
+    print(f"[DEPLOY] Configuring tunnel for host {HOST_NAME}")
+    run_curl_json(
+        "PUT",
+        f"https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/cfd_tunnel/{TUNNEL_ID}/configurations",
+        ingress,
+    )
+
+    dns_query = run_curl_json(
+        "GET",
+        f"https://api.cloudflare.com/client/v4/zones/{ZONE_ID}/dns_records?name={HOST_NAME}&type=CNAME",
+    )
+    records = dns_query.get("result") or []
+    record_id = records[0]["id"] if records else None
+    cname_payload = {
+        "type": "CNAME",
         "name": HOST_NAME,
-        "content": public_ip,
+        "content": f"{TUNNEL_ID}.cfargotunnel.com",
         "ttl": 1,
         "proxied": True,
     }
@@ -674,15 +668,15 @@ def configure_tunnel():
         run_curl_json(
             "PUT",
             f"https://api.cloudflare.com/client/v4/zones/{ZONE_ID}/dns_records/{record_id}",
-            a_payload,
+            cname_payload,
         )
     else:
         run_curl_json(
             "POST",
             f"https://api.cloudflare.com/client/v4/zones/{ZONE_ID}/dns_records",
-            a_payload,
+            cname_payload,
         )
-    print(f"[DEPLOY] DNS configured: {HOST_NAME} -> {public_ip}")
+    print("[DEPLOY] Tunnel ingress and DNS configured")
 
 
 def start_application():
@@ -710,6 +704,15 @@ def start_application():
     )
 
 
+def start_tunnel():
+    print("[DEPLOY] Starting cloudflared tunnel")
+    return subprocess.Popen(
+        ["/tmp/cloudflared", "tunnel", "run", "--token", TUNNEL_TOKEN],
+        cwd=APP_DIR,
+        preexec_fn=os.setsid,
+    )
+
+
 start_time = now()
 set_server_state(status=False, is_stopped=False, start_datetime=start_time)
 
@@ -722,6 +725,8 @@ if not wait_for_http_ready(LOCAL_URL, 60):
 set_server_state(status=True, is_stopped=False, start_datetime=start_time)
 deployment_in_progress = False
 print(f"[DEPLOY] Application ready on {LOCAL_URL}")
+tunnel_proc = start_tunnel()
+time.sleep(2)
 
 while True:
     time.sleep(30)
@@ -732,6 +737,8 @@ while True:
 
     if not process_alive(app_proc):
         graceful_shutdown("application exited")
+    if not process_alive(tunnel_proc):
+        graceful_shutdown("cloudflared exited")
 
     try:
         stop_rows = supa_request(
