@@ -259,9 +259,13 @@ def supa_request(method: str, path: str, data=None):
     }
     body = None if data is None else json.dumps(data).encode("utf-8")
     request = urllib.request.Request(url, data=body, method=method, headers=headers)
-    with urllib.request.urlopen(request, timeout=15) as response:
-        raw = response.read().decode("utf-8").strip()
-        return json.loads(raw) if raw else None
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            raw = response.read().decode("utf-8").strip()
+            return json.loads(raw) if raw else None
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"Supabase request failed for {method} {path}: HTTP {exc.code} {error_body}") from exc
 
 
 def build_redeploy_command(commit: str) -> str:
@@ -437,8 +441,10 @@ def set_server_state(
         payload["commit_version"] = REQUESTED_COMMIT or WORKING_COMMIT_ID
         payload["working_commit_id"] = WORKING_COMMIT_ID
         payload["current_deployment_id"] = WORKING_COMMIT_ID or REQUESTED_COMMIT
-    payload["tunnel_id"] = ACTIVE_TUNNEL_ID or None
-    payload["tunnel_token"] = ACTIVE_TUNNEL_TOKEN or None
+    if ACTIVE_TUNNEL_ID:
+        payload["tunnel_id"] = ACTIVE_TUNNEL_ID
+    if ACTIVE_TUNNEL_TOKEN:
+        payload["tunnel_token"] = ACTIVE_TUNNEL_TOKEN
     if start_datetime:
         payload["start_datetime"] = start_datetime
 
@@ -452,28 +458,31 @@ def set_server_state(
             server_filter(),
             payload,
         )
+    elif SERVER_ID:
+        print(f"[DEPLOY] Server row {SERVER_ID} was not visible for initial lookup; skipping fallback insert")
     else:
         payload["host_name"] = HOST_NAME
-        if SERVER_ID:
-            payload["id"] = SERVER_ID
         supa_request("POST", "/rest/v1/servers", payload)
 
 
 def update_server_heartbeat(status: bool):
+    payload = {
+        "status": status,
+        "is_stopped": False,
+        "last_checked": now(),
+        "resource_usage": collect_resource_usage(),
+        "commit_version": REQUESTED_COMMIT or WORKING_COMMIT_ID,
+        "working_commit_id": WORKING_COMMIT_ID,
+        "current_deployment_id": WORKING_COMMIT_ID or REQUESTED_COMMIT,
+    }
+    if ACTIVE_TUNNEL_ID:
+        payload["tunnel_id"] = ACTIVE_TUNNEL_ID
+    if ACTIVE_TUNNEL_TOKEN:
+        payload["tunnel_token"] = ACTIVE_TUNNEL_TOKEN
     supa_request(
         "PATCH",
         server_filter(),
-        {
-            "status": status,
-            "is_stopped": False,
-            "last_checked": now(),
-            "resource_usage": collect_resource_usage(),
-            "commit_version": REQUESTED_COMMIT or WORKING_COMMIT_ID,
-            "working_commit_id": WORKING_COMMIT_ID,
-            "current_deployment_id": WORKING_COMMIT_ID or REQUESTED_COMMIT,
-            "tunnel_id": ACTIVE_TUNNEL_ID or None,
-            "tunnel_token": ACTIVE_TUNNEL_TOKEN or None,
-        },
+        payload,
     )
 
 
@@ -777,7 +786,10 @@ def start_tunnel(tunnel_token: str):
 
 
 start_time = now()
-set_server_state(status=False, is_stopped=False, start_datetime=start_time)
+try:
+    set_server_state(status=False, is_stopped=False, start_datetime=start_time)
+except Exception as exc:
+    print(f"[DEPLOY] Initial server state update failed: {exc}")
 
 ACTIVE_TUNNEL_ID, ACTIVE_TUNNEL_TOKEN = ensure_tunnel()
 configure_tunnel(ACTIVE_TUNNEL_ID)
@@ -786,7 +798,10 @@ app_proc = start_application()
 if not wait_for_http_ready(LOCAL_URL, 60):
     graceful_shutdown("application failed readiness check")
 
-set_server_state(status=True, is_stopped=False, start_datetime=start_time)
+try:
+    set_server_state(status=True, is_stopped=False, start_datetime=start_time)
+except Exception as exc:
+    print(f"[DEPLOY] Ready server state update failed: {exc}")
 deployment_in_progress = False
 print(f"[DEPLOY] Application ready on {LOCAL_URL}")
 tunnel_proc = start_tunnel(ACTIVE_TUNNEL_TOKEN)
