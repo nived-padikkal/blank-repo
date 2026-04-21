@@ -5,7 +5,8 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="per-deploy-tunnel-v2-build-stop"
+SCRIPT_VERSION="per-deploy-tunnel-v3-auto-restart"
+AUTO_RESTART_AFTER_MINUTES="5"
 
 PROJECT_NAME=""
 PROJECT_TYPE=""
@@ -24,7 +25,6 @@ ACCOUNT_ID=""
 TUNNEL_TOKEN=""
 SUPA_URL=""
 SUPA_KEY=""
-WEBHOOK_URL=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -45,7 +45,6 @@ while [[ $# -gt 0 ]]; do
     --tunnel-token) TUNNEL_TOKEN="$2"; shift 2 ;;
     --supa-url)     SUPA_URL="$2"; shift 2 ;;
     --supa-key)     SUPA_KEY="$2"; shift 2 ;;
-    --webhook-url)  WEBHOOK_URL="$2"; shift 2 ;;
     *)
       echo "[ERROR] Unknown parameter: $1"
       exit 1
@@ -169,8 +168,8 @@ echo "[DEPLOY] Downloading cloudflared ..."
 wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O /tmp/cloudflared
 chmod +x /tmp/cloudflared
 
-export PROJECT_NAME PROJECT_TYPE BUILD_CMD START_CMD PORT HOST_NAME SERVER_ID REPO_URL BRANCH APP_DIR ENV_VARS_JSON COMMIT WORKING_COMMIT_ID
-export CF_TOKEN ZONE_ID ACCOUNT_ID TUNNEL_TOKEN SUPA_URL SUPA_KEY WEBHOOK_URL
+export PROJECT_NAME PROJECT_TYPE BUILD_CMD START_CMD PORT HOST_NAME SERVER_ID REPO_URL BRANCH APP_DIR ENV_VARS_JSON COMMIT WORKING_COMMIT_ID AUTO_RESTART_AFTER_MINUTES
+export CF_TOKEN ZONE_ID ACCOUNT_ID TUNNEL_TOKEN SUPA_URL SUPA_KEY
 
 python3 - <<'PY'
 import json
@@ -199,6 +198,8 @@ APP_DIR = os.environ["APP_DIR"]
 ENV_VARS_JSON = os.environ.get("ENV_VARS_JSON") or "[]"
 REQUESTED_COMMIT = (os.environ.get("COMMIT") or "").strip()
 WORKING_COMMIT_ID = (os.environ.get("WORKING_COMMIT_ID") or "").strip()
+AUTO_RESTART_AFTER_MINUTES = int(os.environ.get("AUTO_RESTART_AFTER_MINUTES") or "50")
+AUTO_RESTART_AFTER_SECONDS = AUTO_RESTART_AFTER_MINUTES * 60
 
 def get_env(name: str, default: str = "") -> str:
     value = (os.environ.get(name) or "").strip()
@@ -218,13 +219,12 @@ ACCOUNT_ID = require_env("ACCOUNT_ID")
 TUNNEL_TOKEN = get_env("TUNNEL_TOKEN")
 SUPA_URL = require_env("SUPA_URL")
 SUPA_KEY = require_env("SUPA_KEY")
-WEBHOOK_URL = get_env("WEBHOOK_URL")
 LOCAL_URL = f"http://127.0.0.1:{PORT}"
 
 app_proc = None
 tunnel_proc = None
 build_proc = None
-webhook_sent = False
+auto_restart_queued = False
 boot_epoch = time.time()
 ACTIVE_TUNNEL_ID = ""
 ACTIVE_TUNNEL_TOKEN = ""
@@ -291,9 +291,24 @@ def build_redeploy_command(commit: str) -> str:
     command += f" --account-id {json.dumps(ACCOUNT_ID)}"
     command += f" --supa-url {json.dumps(SUPA_URL)}"
     command += f" --supa-key {json.dumps(SUPA_KEY)}"
-    if WEBHOOK_URL:
-        command += f" --webhook-url {json.dumps(WEBHOOK_URL)}"
     return command
+
+
+def queue_auto_restart():
+    target_commit = WORKING_COMMIT_ID or REQUESTED_COMMIT
+    if not target_commit:
+        print("[DEPLOY] Auto-restart skipped because no current commit is available")
+        return False
+
+    try:
+        supa_request("POST", "/rest/v1/jules_curl", {
+            "request_curl": build_redeploy_command(target_commit),
+        })
+        print(f"[DEPLOY] Auto-restart queued for commit {target_commit}")
+        return True
+    except Exception as exc:
+        print(f"[DEPLOY] Failed to queue auto-restart: {exc}")
+        return False
 
 
 def queue_requested_redeploy():
@@ -490,29 +505,6 @@ def update_server_heartbeat(status: bool):
         server_filter(),
         payload,
     )
-
-
-def send_webhook(start_time: str):
-    if not WEBHOOK_URL:
-        return
-    payload = json.dumps({
-        "host": HOST_NAME,
-        "status": "running",
-        "start_datetime": start_time,
-        "webhook_fired_at": now(),
-        "message": "Server has been running for 5 minutes",
-    }).encode("utf-8")
-    request = urllib.request.Request(
-        WEBHOOK_URL,
-        data=payload,
-        method="POST",
-        headers={"Content-Type": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=10):
-            print("[WEBHOOK] Sent")
-    except Exception as exc:
-        print(f"[WEBHOOK] Failed: {exc}")
 
 
 def wait_for_http_ready(url: str, timeout_seconds: int) -> bool:
@@ -917,14 +909,13 @@ time.sleep(2)
 while True:
     time.sleep(30)
 
-    if not webhook_sent and (time.time() - boot_epoch) >= 300:
-        send_webhook(start_time)
-        webhook_sent = True
-
     if not process_alive(app_proc):
         graceful_shutdown("application exited")
     if not process_alive(tunnel_proc):
         graceful_shutdown("cloudflared exited")
+
+    if not auto_restart_queued and (time.time() - boot_epoch) >= AUTO_RESTART_AFTER_SECONDS:
+        auto_restart_queued = queue_auto_restart()
 
     try:
         stop_rows = supa_request(
