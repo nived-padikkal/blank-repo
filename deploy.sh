@@ -5,7 +5,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="per-deploy-tunnel-v1"
+SCRIPT_VERSION="per-deploy-tunnel-v2-build-stop"
 
 PROJECT_NAME=""
 PROJECT_TYPE=""
