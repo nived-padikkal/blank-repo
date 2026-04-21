@@ -553,12 +553,13 @@ def is_build_cancel_requested() -> bool:
     try:
         rows = supa_request(
             "GET",
-            server_filter("build_cancel_requested"),
+            server_filter("is_stopped,build_cancel_requested"),
         ) or []
     except Exception as exc:
         print(f"[DEPLOY] Failed to poll build cancel flag: {exc}")
         return False
-    return bool(rows and rows[0].get("build_cancel_requested"))
+    row = rows[0] if rows else {}
+    return bool((row or {}).get("build_cancel_requested")) or bool((row or {}).get("is_stopped"))
 
 
 def start_build():
@@ -572,10 +573,12 @@ def start_build():
 
 
 def cancel_build(reason: str):
-    global shutdown_started
+    global shutdown_started, remote_stop_requested, full_system_shutdown_requested
     if shutdown_started:
         return
     shutdown_started = True
+    remote_stop_requested = True
+    full_system_shutdown_requested = True
 
     print(f"[STOP] Cancel requested during build/startup: {reason}")
     terminate_group(build_proc, "build", 10)
@@ -590,6 +593,28 @@ def cancel_build(reason: str):
         )
     except Exception as exc:
         print(f"[STOP] Failed to persist build cancellation state: {exc}")
+
+    if full_system_shutdown_requested:
+        print("[STOP] Requesting full system shutdown")
+        shutdown_commands = [
+            ["sudo", "-n", "shutdown", "-h", "now"],
+            ["/sbin/shutdown", "-h", "now"],
+            ["shutdown", "-h", "now"],
+            ["systemctl", "poweroff"],
+            ["poweroff"],
+        ]
+        for cmd in shutdown_commands:
+            try:
+                subprocess.Popen(cmd)
+                print(f"[STOP] System shutdown command issued: {' '.join(cmd)}")
+                break
+            except FileNotFoundError:
+                continue
+            except Exception as exc:
+                print(f"[STOP] Shutdown command failed ({' '.join(cmd)}): {exc}")
+        else:
+            print("[STOP] No system shutdown command could be executed")
+
     sys.exit(0)
 
 
@@ -856,7 +881,7 @@ configure_tunnel(ACTIVE_TUNNEL_ID)
 
 build_proc = start_build()
 while process_alive(build_proc):
-    time.sleep(2)
+    time.sleep(5)
     if is_build_cancel_requested():
         cancel_build("remote stop requested during build")
 
@@ -871,7 +896,7 @@ while time.time() < readiness_deadline:
         cancel_build("remote stop requested during startup")
     if is_http_alive(LOCAL_URL):
         break
-    time.sleep(1)
+    time.sleep(5)
 else:
     graceful_shutdown("application failed readiness check")
 
