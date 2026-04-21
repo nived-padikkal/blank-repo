@@ -165,9 +165,6 @@ case "$PROJECT_TYPE" in
     ;;
 esac
 
-echo "[DEPLOY] Running build ..."
-eval "$BUILD_CMD"
-
 echo "[DEPLOY] Downloading cloudflared ..."
 wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O /tmp/cloudflared
 chmod +x /tmp/cloudflared
@@ -226,6 +223,7 @@ LOCAL_URL = f"http://127.0.0.1:{PORT}"
 
 app_proc = None
 tunnel_proc = None
+build_proc = None
 webhook_sent = False
 boot_epoch = time.time()
 ACTIVE_TUNNEL_ID = ""
@@ -305,13 +303,17 @@ def queue_requested_redeploy():
     try:
         rows = supa_request(
             "GET",
-            server_filter("commit_version,current_deployment_id,working_commit_id"),
+            server_filter("commit_version,current_deployment_id,working_commit_id,build_cancel_requested"),
         ) or []
     except Exception as exc:
         print(f"[DEPLOY] Failed to read pending redeploy state: {exc}")
         return
 
     row = rows[0] if rows else {}
+    if bool((row or {}).get("build_cancel_requested")):
+        print("[DEPLOY] Build cancel request is active; skipping deferred redeploy queue")
+        return
+
     target_commit = (
         str((row or {}).get("current_deployment_id") or "").strip()
         or str((row or {}).get("commit_version") or "").strip()
@@ -430,6 +432,7 @@ def set_server_state(
     start_datetime=None,
     resource_usage=None,
     sync_deployment_ids: bool = True,
+    build_cancel_requested=None,
 ):
     payload = {
         "status": status,
@@ -447,6 +450,8 @@ def set_server_state(
         payload["tunnel_token"] = ACTIVE_TUNNEL_TOKEN
     if start_datetime:
         payload["start_datetime"] = start_datetime
+    if build_cancel_requested is not None:
+        payload["build_cancel_requested"] = build_cancel_requested
 
     existing = supa_request(
         "GET",
@@ -469,6 +474,7 @@ def update_server_heartbeat(status: bool):
     payload = {
         "status": status,
         "is_stopped": False,
+        "build_cancel_requested": False,
         "last_checked": now(),
         "resource_usage": collect_resource_usage(),
         "commit_version": REQUESTED_COMMIT or WORKING_COMMIT_ID,
@@ -543,6 +549,50 @@ def process_alive(proc) -> bool:
     return proc is not None and proc.poll() is None
 
 
+def is_build_cancel_requested() -> bool:
+    try:
+        rows = supa_request(
+            "GET",
+            server_filter("build_cancel_requested"),
+        ) or []
+    except Exception as exc:
+        print(f"[DEPLOY] Failed to poll build cancel flag: {exc}")
+        return False
+    return bool(rows and rows[0].get("build_cancel_requested"))
+
+
+def start_build():
+    print(f"[DEPLOY] Running build: {BUILD_CMD}")
+    return subprocess.Popen(
+        ["bash", "-lc", f"exec {BUILD_CMD}"],
+        cwd=APP_DIR,
+        env=os.environ.copy(),
+        preexec_fn=os.setsid,
+    )
+
+
+def cancel_build(reason: str):
+    global shutdown_started
+    if shutdown_started:
+        return
+    shutdown_started = True
+
+    print(f"[STOP] Cancel requested during build/startup: {reason}")
+    terminate_group(build_proc, "build", 10)
+    terminate_group(app_proc, "application", 15)
+    terminate_group(tunnel_proc, "cloudflared", 10)
+    try:
+        set_server_state(
+            status=False,
+            is_stopped=True,
+            sync_deployment_ids=False,
+            build_cancel_requested=False,
+        )
+    except Exception as exc:
+        print(f"[STOP] Failed to persist build cancellation state: {exc}")
+    sys.exit(0)
+
+
 def terminate_group(proc, name: str, timeout_seconds: int):
     if not process_alive(proc):
         return
@@ -592,7 +642,12 @@ def graceful_shutdown(reason: str):
 
     print(f"[STOP] Shutdown requested: {reason}")
     try:
-        set_server_state(status=False, is_stopped=True, sync_deployment_ids=False)
+        set_server_state(
+            status=False,
+            is_stopped=True,
+            sync_deployment_ids=False,
+            build_cancel_requested=False,
+        )
     except Exception as exc:
         print(f"[STOP] Failed to update server state: {exc}")
 
@@ -787,19 +842,46 @@ def start_tunnel(tunnel_token: str):
 
 start_time = now()
 try:
-    set_server_state(status=False, is_stopped=False, start_datetime=start_time)
+    set_server_state(
+        status=False,
+        is_stopped=False,
+        start_datetime=start_time,
+        build_cancel_requested=False,
+    )
 except Exception as exc:
     print(f"[DEPLOY] Initial server state update failed: {exc}")
 
 ACTIVE_TUNNEL_ID, ACTIVE_TUNNEL_TOKEN = ensure_tunnel()
 configure_tunnel(ACTIVE_TUNNEL_ID)
 
+build_proc = start_build()
+while process_alive(build_proc):
+    time.sleep(2)
+    if is_build_cancel_requested():
+        cancel_build("remote stop requested during build")
+
+build_exit_code = build_proc.wait()
+if build_exit_code != 0:
+    raise RuntimeError(f"Build command failed with exit code {build_exit_code}")
+
 app_proc = start_application()
-if not wait_for_http_ready(LOCAL_URL, 60):
+readiness_deadline = time.time() + 60
+while time.time() < readiness_deadline:
+    if is_build_cancel_requested():
+        cancel_build("remote stop requested during startup")
+    if is_http_alive(LOCAL_URL):
+        break
+    time.sleep(1)
+else:
     graceful_shutdown("application failed readiness check")
 
 try:
-    set_server_state(status=True, is_stopped=False, start_datetime=start_time)
+    set_server_state(
+        status=True,
+        is_stopped=False,
+        start_datetime=start_time,
+        build_cancel_requested=False,
+    )
 except Exception as exc:
     print(f"[DEPLOY] Ready server state update failed: {exc}")
 deployment_in_progress = False
