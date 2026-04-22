@@ -6,7 +6,7 @@
 set -euo pipefail
 
 SCRIPT_VERSION="per-deploy-tunnel-v3-auto-restart"
-AUTO_RESTART_AFTER_MINUTES="5"
+AUTO_RESTART_AFTER_MINUTES="50"
 
 PROJECT_NAME=""
 PROJECT_TYPE=""
