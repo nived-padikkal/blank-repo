@@ -318,7 +318,7 @@ def queue_requested_redeploy():
     try:
         rows = supa_request(
             "GET",
-            server_filter("commit_version,current_deployment_id,working_commit_id,build_cancel_requested"),
+            server_filter("commit_version,working_commit_id,build_cancel_requested"),
         ) or []
     except Exception as exc:
         print(f"[DEPLOY] Failed to read pending redeploy state: {exc}")
@@ -330,8 +330,7 @@ def queue_requested_redeploy():
         return
 
     target_commit = (
-        str((row or {}).get("current_deployment_id") or "").strip()
-        or str((row or {}).get("commit_version") or "").strip()
+        str((row or {}).get("commit_version") or "").strip()
     )
     current_commit = str((row or {}).get("working_commit_id") or WORKING_COMMIT_ID or "").strip()
 
@@ -458,7 +457,6 @@ def set_server_state(
     if sync_deployment_ids:
         payload["commit_version"] = REQUESTED_COMMIT or WORKING_COMMIT_ID
         payload["working_commit_id"] = WORKING_COMMIT_ID
-        payload["current_deployment_id"] = WORKING_COMMIT_ID or REQUESTED_COMMIT
     if ACTIVE_TUNNEL_ID:
         payload["tunnel_id"] = ACTIVE_TUNNEL_ID
     if ACTIVE_TUNNEL_TOKEN:
@@ -494,7 +492,6 @@ def update_server_heartbeat(status: bool):
         "resource_usage": collect_resource_usage(),
         "commit_version": REQUESTED_COMMIT or WORKING_COMMIT_ID,
         "working_commit_id": WORKING_COMMIT_ID,
-        "current_deployment_id": WORKING_COMMIT_ID or REQUESTED_COMMIT,
     }
     if ACTIVE_TUNNEL_ID:
         payload["tunnel_id"] = ACTIVE_TUNNEL_ID
