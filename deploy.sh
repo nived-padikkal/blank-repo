@@ -876,6 +876,15 @@ while process_alive(build_proc):
 
 build_exit_code = build_proc.wait()
 if build_exit_code != 0:
+    try:
+        set_server_state(
+            status=False,
+            is_stopped=True,
+            sync_deployment_ids=False,
+            build_cancel_requested=False,
+        )
+    except Exception as exc:
+        print(f"[DEPLOY] Failed to persist build failure state: {exc}")
     raise RuntimeError(f"Build command failed with exit code {build_exit_code}")
 
 app_proc = start_application()
