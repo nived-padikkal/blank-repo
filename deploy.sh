@@ -228,6 +228,7 @@ auto_restart_queued = False
 boot_epoch = time.time()
 ACTIVE_TUNNEL_ID = ""
 ACTIVE_TUNNEL_TOKEN = ""
+LIVE_WORKING_COMMIT_ID = ""
 
 
 def now():
@@ -295,7 +296,7 @@ def build_redeploy_command(commit: str) -> str:
 
 
 def queue_auto_restart():
-    target_commit = WORKING_COMMIT_ID or REQUESTED_COMMIT
+    target_commit = LIVE_WORKING_COMMIT_ID or WORKING_COMMIT_ID or REQUESTED_COMMIT
     if not target_commit:
         print("[DEPLOY] Auto-restart skipped because no current commit is available")
         return False
@@ -332,7 +333,7 @@ def queue_requested_redeploy():
     target_commit = (
         str((row or {}).get("commit_version") or "").strip()
     )
-    current_commit = str((row or {}).get("working_commit_id") or WORKING_COMMIT_ID or "").strip()
+    current_commit = str((row or {}).get("working_commit_id") or LIVE_WORKING_COMMIT_ID or "").strip()
 
     if not target_commit:
         print("[DEPLOY] No target commit found for redeploy")
@@ -355,6 +356,20 @@ def server_filter(select_clause: str = "*") -> str:
     if SERVER_ID:
         return f"/rest/v1/servers?id=eq.{urllib.parse.quote(SERVER_ID, safe='')}&select={select_clause}"
     return f"/rest/v1/servers?host_name=eq.{urllib.parse.quote(HOST_NAME, safe='')}&select={select_clause}"
+
+
+def load_existing_working_commit() -> str:
+    try:
+        rows = supa_request(
+            "GET",
+            server_filter("working_commit_id"),
+        ) or []
+    except Exception as exc:
+        print(f"[DEPLOY] Failed to load existing working commit: {exc}")
+        return ""
+
+    row = rows[0] if rows else {}
+    return str((row or {}).get("working_commit_id") or "").strip()
 
 
 def round_metric(value):
@@ -456,7 +471,7 @@ def set_server_state(
     }
     if sync_deployment_ids:
         payload["commit_version"] = REQUESTED_COMMIT or WORKING_COMMIT_ID
-        payload["working_commit_id"] = WORKING_COMMIT_ID
+        payload["working_commit_id"] = WORKING_COMMIT_ID if status else LIVE_WORKING_COMMIT_ID
     if ACTIVE_TUNNEL_ID:
         payload["tunnel_id"] = ACTIVE_TUNNEL_ID
     if ACTIVE_TUNNEL_TOKEN:
@@ -855,6 +870,7 @@ def start_tunnel(tunnel_token: str):
 
 
 start_time = now()
+LIVE_WORKING_COMMIT_ID = load_existing_working_commit()
 try:
     set_server_state(
         status=False,
@@ -905,6 +921,7 @@ try:
         start_datetime=start_time,
         build_cancel_requested=False,
     )
+    LIVE_WORKING_COMMIT_ID = WORKING_COMMIT_ID
 except Exception as exc:
     print(f"[DEPLOY] Ready server state update failed: {exc}")
 deployment_in_progress = False
