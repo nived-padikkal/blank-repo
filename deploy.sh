@@ -25,6 +25,8 @@ ACCOUNT_ID=""
 TUNNEL_TOKEN=""
 SUPA_URL=""
 SUPA_KEY=""
+DB_DATABASE_TYPE="none"
+DB_DATABASE_URL=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -45,6 +47,8 @@ while [[ $# -gt 0 ]]; do
     --tunnel-token) TUNNEL_TOKEN="$2"; shift 2 ;;
     --supa-url)     SUPA_URL="$2"; shift 2 ;;
     --supa-key)     SUPA_KEY="$2"; shift 2 ;;
+    --database-type) DB_DATABASE_TYPE="$2"; shift 2 ;;
+    --database-url)  DB_DATABASE_URL="$2"; shift 2 ;;
     *)
       echo "[ERROR] Unknown parameter: $1"
       exit 1
@@ -95,6 +99,7 @@ echo "  repo      : $REPO_URL"
 [[ -n "$BRANCH" ]] && echo "  branch    : $BRANCH"
 [[ -n "$COMMIT" ]] && echo "  commit    : $COMMIT"
 [[ "$ENV_VARS_JSON" != "[]" && -n "$ENV_VARS_JSON" ]] && echo "  env vars  : configured"
+[[ "$DB_DATABASE_TYPE" != "none" && -n "$DB_DATABASE_TYPE" ]] && echo "  database  : $DB_DATABASE_TYPE"
 echo "=========================================="
 echo ""
 
@@ -168,7 +173,7 @@ echo "[DEPLOY] Downloading cloudflared ..."
 wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O /tmp/cloudflared
 chmod +x /tmp/cloudflared
 
-export PROJECT_NAME PROJECT_TYPE BUILD_CMD START_CMD PORT HOST_NAME SERVER_ID REPO_URL BRANCH APP_DIR ENV_VARS_JSON COMMIT WORKING_COMMIT_ID AUTO_RESTART_AFTER_MINUTES
+export PROJECT_NAME PROJECT_TYPE BUILD_CMD START_CMD PORT HOST_NAME SERVER_ID REPO_URL BRANCH APP_DIR ENV_VARS_JSON COMMIT WORKING_COMMIT_ID AUTO_RESTART_AFTER_MINUTES DB_DATABASE_TYPE DB_DATABASE_URL
 export CF_TOKEN ZONE_ID ACCOUNT_ID TUNNEL_TOKEN SUPA_URL SUPA_KEY
 
 python3 - <<'PY'
@@ -225,6 +230,7 @@ LOCAL_URL = f"http://127.0.0.1:{PORT}"
 app_proc = None
 tunnel_proc = None
 build_proc = None
+mongo_proc = None
 auto_restart_queued = False
 boot_epoch = time.time()
 ACTIVE_TUNNEL_ID = ""
@@ -245,6 +251,33 @@ runtime_log_state = {
 last_runtime_log_persist = 0.0
 MAX_RUNTIME_LOG_LINES = 500
 RUNTIME_LOG_FLUSH_INTERVAL_SECONDS = 2.0
+
+
+def load_runtime_env_vars():
+    try:
+        env_vars = json.loads(ENV_VARS_JSON)
+    except json.JSONDecodeError:
+        return []
+
+    normalized = []
+    for item in env_vars or []:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("key") or "").strip()
+        if not key:
+            continue
+        normalized.append({
+            "key": key,
+            "value": "" if item.get("value") is None else str(item.get("value")),
+        })
+    return normalized
+
+
+RUNTIME_ENV_VARS = load_runtime_env_vars()
+DATABASE_TYPE = (os.environ.get("DB_DATABASE_TYPE") or "none").strip().lower()
+MONGODB_URI = (os.environ.get("DB_DATABASE_URL") or "").strip()
+if DATABASE_TYPE in {"mongo", "mongodb"} and not MONGODB_URI:
+    MONGODB_URI = "mongodb://localhost:27017/"
 
 
 def now():
@@ -407,7 +440,7 @@ def load_latest_deploy_config() -> dict:
     try:
         rows = supa_request(
             "GET",
-            server_filter("id,project_name,runtime,build_command,start_command,port,host_name,repo_url,branch,env_vars"),
+            server_filter("id,project_name,runtime,build_command,start_command,port,host_name,repo_url,branch,env_vars,database_type,database_url"),
         ) or []
     except Exception as exc:
         print(f"[DEPLOY] Failed to load latest deploy config; using current command args: {exc}")
@@ -426,6 +459,8 @@ def build_redeploy_command(commit: str) -> str:
     host_name = pick_config_value(latest_config, "host_name", HOST_NAME)
     repo_url = pick_config_value(latest_config, "repo_url", REPO_URL)
     branch = pick_config_value(latest_config, "branch", BRANCH)
+    database_type = pick_config_value(latest_config, "database_type", DATABASE_TYPE) or "none"
+    database_url = pick_config_value(latest_config, "database_url", MONGODB_URI)
     env_vars_json = normalize_env_vars_for_command(
         latest_config.get("env_vars") if "env_vars" in latest_config else ENV_VARS_JSON
     )
@@ -447,6 +482,10 @@ def build_redeploy_command(commit: str) -> str:
         command += f" --branch {json.dumps(branch)}"
     if commit:
         command += f" --commit {json.dumps(commit)}"
+    if database_type and database_type != "none":
+        command += f" --database-type {json.dumps(database_type)}"
+        if database_url:
+            command += f" --database-url {json.dumps(database_url)}"
     if env_vars_json and env_vars_json != "[]":
         command += f" --env-vars {json.dumps(env_vars_json)}"
     command += f" --cf-token {json.dumps(CF_TOKEN)}"
@@ -697,6 +736,216 @@ def is_port_open(port: str) -> bool:
         sock.close()
 
 
+def mongodb_target():
+    uri = (MONGODB_URI or "mongodb://localhost:27017/").strip()
+    try:
+        parsed = urllib.parse.urlparse(uri)
+    except Exception:
+        return "127.0.0.1", 27017, uri
+
+    host = parsed.hostname or "localhost"
+    try:
+        port = parsed.port or 27017
+    except ValueError:
+        port = 27017
+    connect_host = "127.0.0.1" if host in {"localhost", "::1"} else host
+    return connect_host, port, uri
+
+
+def should_prepare_local_mongodb() -> bool:
+    uri = (MONGODB_URI or "").strip().lower()
+    uses_mongodb = DATABASE_TYPE in {"mongo", "mongodb"} or uri.startswith(("mongodb://", "mongodb+srv://"))
+    if not uses_mongodb or uri.startswith("mongodb+srv://"):
+        return False
+
+    host, _, _ = mongodb_target()
+    return host in {"localhost", "127.0.0.1", "::1"}
+
+
+def privileged_command(cmd):
+    try:
+        is_root = os.geteuid() == 0
+    except AttributeError:
+        is_root = False
+    if is_root:
+        return cmd
+    if shutil.which("sudo"):
+        return ["sudo", "-n", *cmd]
+    return []
+
+
+def run_privileged(cmd, *, check=True, input_data=None):
+    final_cmd = privileged_command(cmd)
+    if not final_cmd:
+        raise RuntimeError("MongoDB setup requires root or passwordless sudo")
+    return subprocess.run(
+        final_cmd,
+        input=input_data,
+        capture_output=True,
+        check=check,
+    )
+
+
+def read_os_release() -> dict:
+    values = {}
+    try:
+        with open("/etc/os-release", "r", encoding="utf-8") as os_release:
+            for line in os_release:
+                if "=" not in line:
+                    continue
+                key, value = line.rstrip().split("=", 1)
+                values[key] = value.strip().strip('"')
+    except OSError:
+        pass
+    return values
+
+
+def write_root_file(path: str, content: str):
+    try:
+        is_root = os.geteuid() == 0
+    except AttributeError:
+        is_root = False
+    if is_root:
+        with open(path, "w", encoding="utf-8") as target_file:
+            target_file.write(content)
+        return
+    final_cmd = privileged_command(["tee", path])
+    if not final_cmd:
+        raise RuntimeError("MongoDB repository setup requires root or passwordless sudo")
+    subprocess.run(
+        final_cmd,
+        input=content.encode("utf-8"),
+        stdout=subprocess.DEVNULL,
+        check=True,
+    )
+
+
+def add_mongodb_apt_repository() -> bool:
+    if not shutil.which("curl") or not shutil.which("gpg"):
+        run_privileged(["apt-get", "update"], check=False)
+        run_privileged(["apt-get", "install", "-y", "curl", "gnupg", "ca-certificates"], check=False)
+
+    os_release = read_os_release()
+    distro_id = (os_release.get("ID") or "").lower()
+    codename = os_release.get("VERSION_CODENAME") or os_release.get("UBUNTU_CODENAME") or ""
+    mongo_version = "7.0"
+    keyring_path = f"/usr/share/keyrings/mongodb-server-{mongo_version}.gpg"
+
+    if distro_id == "ubuntu":
+        repo_codename = codename if codename in {"focal", "jammy"} else "jammy"
+        repo_line = (
+            f"deb [ arch=amd64,arm64 signed-by={keyring_path} ] "
+            f"https://repo.mongodb.org/apt/ubuntu {repo_codename}/mongodb-org/{mongo_version} multiverse\n"
+        )
+    elif distro_id == "debian":
+        repo_codename = codename if codename in {"bullseye", "bookworm"} else "bookworm"
+        repo_line = (
+            f"deb [ arch=amd64,arm64 signed-by={keyring_path} ] "
+            f"https://repo.mongodb.org/apt/debian {repo_codename}/mongodb-org/{mongo_version} main\n"
+        )
+    else:
+        return False
+
+    key_response = urllib.request.urlopen(
+        f"https://pgp.mongodb.com/server-{mongo_version}.asc",
+        timeout=30,
+    )
+    key_data = key_response.read()
+    run_privileged(["gpg", "--batch", "--yes", "--dearmor", "-o", keyring_path], input_data=key_data)
+    write_root_file(f"/etc/apt/sources.list.d/mongodb-org-{mongo_version}.list", repo_line)
+    return True
+
+
+def install_mongodb_if_needed():
+    if shutil.which("mongod"):
+        return
+    if not shutil.which("apt-get"):
+        raise RuntimeError("MongoDB is not installed and apt-get is unavailable")
+
+    append_runtime_log("build", "[DEPLOY] Installing MongoDB runtime", persist=True)
+    run_privileged(["apt-get", "update"], check=False)
+    for package_name in ("mongodb-org", "mongodb", "mongodb-server-core"):
+        result = run_privileged(["apt-get", "install", "-y", package_name], check=False)
+        if result.returncode == 0 and shutil.which("mongod"):
+            return
+
+    if add_mongodb_apt_repository():
+        run_privileged(["apt-get", "update"], check=False)
+        run_privileged(["apt-get", "install", "-y", "mongodb-org"], check=False)
+
+    if not shutil.which("mongod"):
+        raise RuntimeError("MongoDB installation failed; mongod was not found")
+
+
+def start_local_mongodb():
+    global mongo_proc
+    host, port, uri = mongodb_target()
+    if is_port_open(str(port)):
+        append_runtime_log("build", f"[DEPLOY] MongoDB already available at {uri}", persist=True)
+        return
+
+    append_runtime_log("build", f"[DEPLOY] Starting MongoDB at {uri}", persist=True)
+    for service_cmd in (["systemctl", "start", "mongod"], ["service", "mongod", "start"]):
+        try:
+            run_privileged(service_cmd, check=False)
+            if wait_for_port_open(port, 15):
+                return
+        except Exception:
+            pass
+
+    data_dir = f"/tmp/mhserver-mongodb-{port}"
+    os.makedirs(data_dir, exist_ok=True)
+    log_path = os.path.join(data_dir, "mongod.log")
+    log_file = open(log_path, "a", encoding="utf-8")
+    mongo_proc = subprocess.Popen(
+        [
+            "mongod",
+            "--dbpath", data_dir,
+            "--bind_ip", host,
+            "--port", str(port),
+        ],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        preexec_fn=os.setsid,
+    )
+    if not wait_for_port_open(port, 30):
+        raise RuntimeError(f"MongoDB did not become ready on port {port}")
+
+
+def wait_for_port_open(port: int, timeout_seconds: int) -> bool:
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        if is_port_open(str(port)):
+            return True
+        time.sleep(1)
+    return is_port_open(str(port))
+
+
+def prepare_database_services():
+    if not should_prepare_local_mongodb():
+        return
+    install_mongodb_if_needed()
+    start_local_mongodb()
+    append_runtime_log("build", "[DEPLOY] MongoDB is ready", persist=True)
+
+
+def build_process_env():
+    env = os.environ.copy()
+    for item in RUNTIME_ENV_VARS:
+        key = str(item.get("key") or "").strip()
+        if not key:
+            continue
+        env[key] = "" if item.get("value") is None else str(item.get("value"))
+
+    if DATABASE_TYPE in {"mongo", "mongodb"} or (MONGODB_URI or "").lower().startswith("mongodb"):
+        mongo_uri = MONGODB_URI or "mongodb://localhost:27017/"
+        env["MHSERVER_DATABASE_TYPE"] = "mongodb"
+        env["MONGODB_URI"] = mongo_uri
+        env["MONGO_URI"] = mongo_uri
+        env["DATABASE_URL"] = mongo_uri
+    return env
+
+
 def process_alive(proc) -> bool:
     return proc is not None and proc.poll() is None
 
@@ -719,7 +968,7 @@ def start_build():
     return subprocess.Popen(
         ["bash", "-lc", f"exec {BUILD_CMD}"],
         cwd=APP_DIR,
-        env=os.environ.copy(),
+        env=build_process_env(),
         preexec_fn=os.setsid,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -741,6 +990,7 @@ def cancel_build(reason: str):
     terminate_group(build_proc, "build", 10)
     terminate_group(app_proc, "application", 15)
     terminate_group(tunnel_proc, "cloudflared", 10)
+    terminate_group(mongo_proc, "mongodb", 15)
     try:
         set_server_state(
             status=False,
@@ -839,6 +1089,7 @@ def graceful_shutdown(reason: str):
     if not wait_for_port_close(PORT, 10):
         print(f"[STOP] Port {PORT} is still open after app shutdown")
     terminate_group(tunnel_proc, "cloudflared", 15)
+    terminate_group(mongo_proc, "mongodb", 15)
     queue_requested_redeploy()
     print("[STOP] Graceful shutdown complete")
 
@@ -991,18 +1242,7 @@ def configure_tunnel(tunnel_id: str):
 
 
 def start_application():
-    env = os.environ.copy()
-    try:
-        env_vars = json.loads(ENV_VARS_JSON)
-    except json.JSONDecodeError:
-        env_vars = []
-    for item in env_vars:
-        if not isinstance(item, dict):
-            continue
-        key = str(item.get("key") or "").strip()
-        if not key:
-            continue
-        env[key] = "" if item.get("value") is None else str(item.get("value"))
+    env = build_process_env()
     env["PORT"] = PORT
     env["HOST"] = "0.0.0.0"
     env["NODE_ENV"] = "production"
@@ -1044,6 +1284,21 @@ persist_runtime_logs(force=True)
 
 ACTIVE_TUNNEL_ID, ACTIVE_TUNNEL_TOKEN = ensure_tunnel()
 configure_tunnel(ACTIVE_TUNNEL_ID)
+
+try:
+    prepare_database_services()
+except Exception as exc:
+    set_runtime_log_status("failed", failed_at=now())
+    try:
+        set_server_state(
+            status=False,
+            is_stopped=True,
+            sync_deployment_ids=False,
+            build_cancel_requested=False,
+        )
+    except Exception as state_exc:
+        print(f"[DEPLOY] Failed to persist database setup failure state: {state_exc}")
+    raise RuntimeError(f"Database setup failed: {exc}") from exc
 
 build_proc = start_build()
 build_reader = threading.Thread(target=stream_process_output, args=(build_proc, "build"), daemon=True)
