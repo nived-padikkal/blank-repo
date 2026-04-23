@@ -179,6 +179,7 @@ import signal
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -228,11 +229,102 @@ auto_restart_queued = False
 boot_epoch = time.time()
 ACTIVE_TUNNEL_ID = ""
 ACTIVE_TUNNEL_TOKEN = ""
-LIVE_WORKING_COMMIT_ID = ""
+runtime_logs_lock = threading.Lock()
+runtime_log_state = {
+    "deployment_id": WORKING_COMMIT_ID or REQUESTED_COMMIT or "",
+    "status": "building",
+    "started_at": "",
+    "ready_at": "",
+    "failed_at": "",
+    "build_command": BUILD_CMD,
+    "start_command": START_CMD,
+    "build_exit_code": None,
+    "build": [],
+    "start": [],
+}
+last_runtime_log_persist = 0.0
+MAX_RUNTIME_LOG_LINES = 500
+RUNTIME_LOG_FLUSH_INTERVAL_SECONDS = 2.0
 
 
 def now():
     return datetime.now(timezone.utc).isoformat()
+
+
+def classify_log_line(line: str) -> str:
+    lowered = (line or "").lower()
+    if any(token in lowered for token in ["error", "failed", "traceback", "exception"]):
+        return "error"
+    if any(token in lowered for token in ["warn", "deprecated"]):
+        return "warning"
+    if any(token in lowered for token in ["success", "ready", "running", "listening", "serving"]):
+        return "success"
+    return "info"
+
+
+def persist_runtime_logs(force: bool = False):
+    global last_runtime_log_persist
+    current_time = time.time()
+    if not force and current_time - last_runtime_log_persist < RUNTIME_LOG_FLUSH_INTERVAL_SECONDS:
+        return
+
+    with runtime_logs_lock:
+        payload = json.loads(json.dumps(runtime_log_state))
+
+    try:
+        supa_request("PATCH", server_filter(), {
+            "runtime_logs": payload,
+            "last_checked": now(),
+        })
+        last_runtime_log_persist = current_time
+    except Exception as exc:
+        print(f"[DEPLOY] Failed to persist runtime logs: {exc}")
+
+
+def set_runtime_log_status(status: str, **fields):
+    with runtime_logs_lock:
+        runtime_log_state["status"] = status
+        for key, value in fields.items():
+            runtime_log_state[key] = value
+    persist_runtime_logs(force=True)
+
+
+def append_runtime_log(phase: str, line: str, persist: bool = True):
+    clean_line = (line or "").rstrip("\r\n")
+    if not clean_line:
+        return
+
+    print(clean_line, flush=True)
+    entry = {
+        "timestamp": now(),
+        "phase": phase,
+        "message": clean_line,
+        "type": classify_log_line(clean_line),
+    }
+    with runtime_logs_lock:
+        entries = runtime_log_state.setdefault(phase, [])
+        entries.append(entry)
+        if len(entries) > MAX_RUNTIME_LOG_LINES:
+            del entries[: len(entries) - MAX_RUNTIME_LOG_LINES]
+    if persist:
+        persist_runtime_logs()
+
+
+def stream_process_output(proc, phase: str, capture_event=None):
+    if not proc or not proc.stdout:
+        return
+    try:
+        for line in iter(proc.stdout.readline, ""):
+            should_capture = capture_event is None or capture_event.is_set()
+            if should_capture:
+                append_runtime_log(phase, line, persist=True)
+            else:
+                print(line.rstrip("\r\n"), flush=True)
+    finally:
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
 
 
 def run_curl_json(method: str, url: str, data=None):
@@ -296,7 +388,7 @@ def build_redeploy_command(commit: str) -> str:
 
 
 def queue_auto_restart():
-    target_commit = LIVE_WORKING_COMMIT_ID or WORKING_COMMIT_ID or REQUESTED_COMMIT
+    target_commit = WORKING_COMMIT_ID or REQUESTED_COMMIT
     if not target_commit:
         print("[DEPLOY] Auto-restart skipped because no current commit is available")
         return False
@@ -333,7 +425,7 @@ def queue_requested_redeploy():
     target_commit = (
         str((row or {}).get("commit_version") or "").strip()
     )
-    current_commit = str((row or {}).get("working_commit_id") or LIVE_WORKING_COMMIT_ID or "").strip()
+    current_commit = str((row or {}).get("working_commit_id") or WORKING_COMMIT_ID or "").strip()
 
     if not target_commit:
         print("[DEPLOY] No target commit found for redeploy")
@@ -356,20 +448,6 @@ def server_filter(select_clause: str = "*") -> str:
     if SERVER_ID:
         return f"/rest/v1/servers?id=eq.{urllib.parse.quote(SERVER_ID, safe='')}&select={select_clause}"
     return f"/rest/v1/servers?host_name=eq.{urllib.parse.quote(HOST_NAME, safe='')}&select={select_clause}"
-
-
-def load_existing_working_commit() -> str:
-    try:
-        rows = supa_request(
-            "GET",
-            server_filter("working_commit_id"),
-        ) or []
-    except Exception as exc:
-        print(f"[DEPLOY] Failed to load existing working commit: {exc}")
-        return ""
-
-    row = rows[0] if rows else {}
-    return str((row or {}).get("working_commit_id") or "").strip()
 
 
 def round_metric(value):
@@ -471,7 +549,7 @@ def set_server_state(
     }
     if sync_deployment_ids:
         payload["commit_version"] = REQUESTED_COMMIT or WORKING_COMMIT_ID
-        payload["working_commit_id"] = WORKING_COMMIT_ID if status else LIVE_WORKING_COMMIT_ID
+        payload["working_commit_id"] = WORKING_COMMIT_ID
     if ACTIVE_TUNNEL_ID:
         payload["tunnel_id"] = ACTIVE_TUNNEL_ID
     if ACTIVE_TUNNEL_TOKEN:
@@ -567,12 +645,16 @@ def is_build_cancel_requested() -> bool:
 
 
 def start_build():
-    print(f"[DEPLOY] Running build: {BUILD_CMD}")
+    append_runtime_log("build", f"[DEPLOY] Running build: {BUILD_CMD}", persist=True)
     return subprocess.Popen(
         ["bash", "-lc", f"exec {BUILD_CMD}"],
         cwd=APP_DIR,
         env=os.environ.copy(),
         preexec_fn=os.setsid,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
     )
 
 
@@ -585,6 +667,7 @@ def cancel_build(reason: str):
     full_system_shutdown_requested = True
 
     print(f"[STOP] Cancel requested during build/startup: {reason}")
+    set_runtime_log_status("cancelled", failed_at=now())
     terminate_group(build_proc, "build", 10)
     terminate_group(app_proc, "application", 15)
     terminate_group(tunnel_proc, "cloudflared", 10)
@@ -670,6 +753,8 @@ def graceful_shutdown(reason: str):
     shutdown_started = True
 
     print(f"[STOP] Shutdown requested: {reason}")
+    if deployment_in_progress:
+        set_runtime_log_status("failed", failed_at=now())
     try:
         set_server_state(
             status=False,
@@ -851,12 +936,16 @@ def start_application():
     env["PORT"] = PORT
     env["HOST"] = "0.0.0.0"
     env["NODE_ENV"] = "production"
-    print(f"[DEPLOY] Starting {PROJECT_TYPE} app: {START_CMD}")
+    append_runtime_log("start", f"[DEPLOY] Starting {PROJECT_TYPE} app: {START_CMD}", persist=True)
     return subprocess.Popen(
         ["bash", "-lc", f"exec {START_CMD}"],
         cwd=APP_DIR,
         env=env,
         preexec_fn=os.setsid,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
     )
 
 
@@ -870,7 +959,8 @@ def start_tunnel(tunnel_token: str):
 
 
 start_time = now()
-LIVE_WORKING_COMMIT_ID = load_existing_working_commit()
+with runtime_logs_lock:
+    runtime_log_state["started_at"] = start_time
 try:
     set_server_state(
         status=False,
@@ -880,30 +970,33 @@ try:
     )
 except Exception as exc:
     print(f"[DEPLOY] Initial server state update failed: {exc}")
+persist_runtime_logs(force=True)
 
 ACTIVE_TUNNEL_ID, ACTIVE_TUNNEL_TOKEN = ensure_tunnel()
 configure_tunnel(ACTIVE_TUNNEL_ID)
 
 build_proc = start_build()
+build_reader = threading.Thread(target=stream_process_output, args=(build_proc, "build"), daemon=True)
+build_reader.start()
 while process_alive(build_proc):
     time.sleep(5)
     if is_build_cancel_requested():
         cancel_build("remote stop requested during build")
 
 build_exit_code = build_proc.wait()
+build_reader.join(timeout=5)
+with runtime_logs_lock:
+    runtime_log_state["build_exit_code"] = build_exit_code
 if build_exit_code != 0:
-    try:
-        set_server_state(
-            status=False,
-            is_stopped=True,
-            sync_deployment_ids=False,
-            build_cancel_requested=False,
-        )
-    except Exception as exc:
-        print(f"[DEPLOY] Failed to persist build failure state: {exc}")
+    set_runtime_log_status("failed", failed_at=now())
     raise RuntimeError(f"Build command failed with exit code {build_exit_code}")
+persist_runtime_logs(force=True)
 
 app_proc = start_application()
+startup_capture_event = threading.Event()
+startup_capture_event.set()
+app_reader = threading.Thread(target=stream_process_output, args=(app_proc, "start", startup_capture_event), daemon=True)
+app_reader.start()
 readiness_deadline = time.time() + 60
 while time.time() < readiness_deadline:
     if is_build_cancel_requested():
@@ -912,7 +1005,10 @@ while time.time() < readiness_deadline:
         break
     time.sleep(5)
 else:
+    set_runtime_log_status("failed", failed_at=now())
     graceful_shutdown("application failed readiness check")
+
+startup_capture_event.clear()
 
 try:
     set_server_state(
@@ -921,11 +1017,11 @@ try:
         start_datetime=start_time,
         build_cancel_requested=False,
     )
-    LIVE_WORKING_COMMIT_ID = WORKING_COMMIT_ID
 except Exception as exc:
     print(f"[DEPLOY] Ready server state update failed: {exc}")
 deployment_in_progress = False
-print(f"[DEPLOY] Application ready on {LOCAL_URL}")
+append_runtime_log("start", f"[DEPLOY] Application ready on {LOCAL_URL}", persist=True)
+set_runtime_log_status("running", ready_at=now())
 tunnel_proc = start_tunnel(ACTIVE_TUNNEL_TOKEN)
 time.sleep(2)
 
