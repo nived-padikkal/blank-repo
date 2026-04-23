@@ -262,6 +262,10 @@ def classify_log_line(line: str) -> str:
     return "info"
 
 
+def strip_ansi(value: str) -> str:
+    return re.sub(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])", "", value or "")
+
+
 def persist_runtime_logs(force: bool = False):
     global last_runtime_log_persist
     current_time = time.time()
@@ -290,11 +294,12 @@ def set_runtime_log_status(status: str, **fields):
 
 
 def append_runtime_log(phase: str, line: str, persist: bool = True):
-    clean_line = (line or "").rstrip("\r\n")
+    raw_line = (line or "").rstrip("\r\n")
+    clean_line = strip_ansi(raw_line)
     if not clean_line:
         return
 
-    print(clean_line, flush=True)
+    print(raw_line, flush=True)
     entry = {
         "timestamp": now(),
         "phase": phase,
