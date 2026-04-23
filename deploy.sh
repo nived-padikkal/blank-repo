@@ -1059,6 +1059,15 @@ with runtime_logs_lock:
     runtime_log_state["build_exit_code"] = build_exit_code
 if build_exit_code != 0:
     set_runtime_log_status("failed", failed_at=now())
+    try:
+        set_server_state(
+            status=False,
+            is_stopped=True,
+            sync_deployment_ids=False,
+            build_cancel_requested=False,
+        )
+    except Exception as exc:
+        print(f"[DEPLOY] Failed to persist build failure state: {exc}")
     raise RuntimeError(f"Build command failed with exit code {build_exit_code}")
 persist_runtime_logs(force=True)
 
