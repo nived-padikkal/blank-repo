@@ -364,26 +364,91 @@ def supa_request(method: str, path: str, data=None):
         raise RuntimeError(f"Supabase request failed for {method} {path}: HTTP {exc.code} {error_body}") from exc
 
 
+def normalize_project_type(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    if "python" in normalized:
+        return "python"
+    if "node" in normalized:
+        return "node"
+    return normalized
+
+
+def pick_config_value(config: dict, key: str, fallback: str = "") -> str:
+    value = (config or {}).get(key)
+    if value not in (None, ""):
+        return str(value).strip()
+    return str(fallback or "").strip()
+
+
+def normalize_env_vars_for_command(value) -> str:
+    if value is None:
+        value = ENV_VARS_JSON
+    if isinstance(value, str):
+        try:
+            value = json.loads(value or "[]")
+        except json.JSONDecodeError:
+            value = []
+
+    normalized = []
+    for item in value or []:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("key") or "").strip()
+        if not key:
+            continue
+        normalized.append({
+            "key": key,
+            "value": "" if item.get("value") is None else str(item.get("value")),
+        })
+    return json.dumps(normalized)
+
+
+def load_latest_deploy_config() -> dict:
+    try:
+        rows = supa_request(
+            "GET",
+            server_filter("id,project_name,runtime,build_command,start_command,port,host_name,repo_url,branch,env_vars"),
+        ) or []
+    except Exception as exc:
+        print(f"[DEPLOY] Failed to load latest deploy config; using current command args: {exc}")
+        return {}
+    return rows[0] if rows else {}
+
+
 def build_redeploy_command(commit: str) -> str:
+    latest_config = load_latest_deploy_config()
+    server_id = pick_config_value(latest_config, "id", SERVER_ID)
+    project_name = pick_config_value(latest_config, "project_name", PROJECT_NAME)
+    project_type = normalize_project_type(pick_config_value(latest_config, "runtime", PROJECT_TYPE)) or PROJECT_TYPE
+    build_cmd = pick_config_value(latest_config, "build_command", BUILD_CMD)
+    start_cmd = pick_config_value(latest_config, "start_command", START_CMD)
+    port = pick_config_value(latest_config, "port", PORT)
+    host_name = pick_config_value(latest_config, "host_name", HOST_NAME)
+    repo_url = pick_config_value(latest_config, "repo_url", REPO_URL)
+    branch = pick_config_value(latest_config, "branch", BRANCH)
+    env_vars_json = normalize_env_vars_for_command(
+        latest_config.get("env_vars") if "env_vars" in latest_config else ENV_VARS_JSON
+    )
+
     command = (
         "curl -fsSL https://raw.githubusercontent.com/"
         "nived-padikkal/blank-repo/main/deploy.sh | "
-        f"bash -s -- --project-name {json.dumps(PROJECT_NAME)} "
-        f"--type {json.dumps(PROJECT_TYPE)} "
-        f"--build {json.dumps(BUILD_CMD)} "
-        f"--start {json.dumps(START_CMD)} "
-        f"--port {json.dumps(PORT)} "
-        f"--host-name {json.dumps(HOST_NAME)} "
-        f"--repo-url {json.dumps(REPO_URL)}"
+        f"bash -s -- --project-name {json.dumps(project_name)} "
+        f"--type {json.dumps(project_type)} "
+        f"--build {json.dumps(build_cmd)} "
+        f"--start {json.dumps(start_cmd)} "
+        f"--port {json.dumps(port)} "
+        f"--host-name {json.dumps(host_name)} "
+        f"--repo-url {json.dumps(repo_url)}"
     )
-    if SERVER_ID:
-        command += f" --server-id {json.dumps(SERVER_ID)}"
-    if BRANCH:
-        command += f" --branch {json.dumps(BRANCH)}"
+    if server_id:
+        command += f" --server-id {json.dumps(server_id)}"
+    if branch:
+        command += f" --branch {json.dumps(branch)}"
     if commit:
         command += f" --commit {json.dumps(commit)}"
-    if ENV_VARS_JSON and ENV_VARS_JSON != "[]":
-        command += f" --env-vars {json.dumps(ENV_VARS_JSON)}"
+    if env_vars_json and env_vars_json != "[]":
+        command += f" --env-vars {json.dumps(env_vars_json)}"
     command += f" --cf-token {json.dumps(CF_TOKEN)}"
     command += f" --zone-id {json.dumps(ZONE_ID)}"
     command += f" --account-id {json.dumps(ACCOUNT_ID)}"
