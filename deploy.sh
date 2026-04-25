@@ -5,7 +5,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="per-deploy-tunnel-v3-auto-restart-mongodb-repo"
+SCRIPT_VERSION="per-deploy-tunnel-v3-auto-restart-mongodb-tarball"
 AUTO_RESTART_AFTER_MINUTES="50"
 
 PROJECT_NAME=""
@@ -26,6 +26,12 @@ ACCOUNT_ID=""
 TUNNEL_TOKEN=""
 SUPA_URL=""
 SUPA_KEY=""
+MONGODB_BINARY_URL="https://fastdl.mongodb.org/linux/mongodb-linux-x86_64-ubuntu2204-6.0.6.tgz"
+MONGODB_BINARY_NAME="mongodb-linux-x86_64-ubuntu2204-6.0.6"
+MONGODB_INSTALL_DIR="/opt/${MONGODB_BINARY_NAME}"
+MONGODB_DATA_DIR="/var/lib/mongodb"
+MONGODB_LOG_DIR="/var/log/mongodb"
+MONGODB_LOG_FILE="${MONGODB_LOG_DIR}/mongod.log"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -178,72 +184,6 @@ run_with_privilege() {
   return 1
 }
 
-detect_ubuntu_codename() {
-  if [[ ! -r /etc/os-release ]]; then
-    return 1
-  fi
-
-  local os_id=""
-  local version_codename=""
-  local ubuntu_codename=""
-  # shellcheck disable=SC1091
-  . /etc/os-release
-  os_id="${ID:-}"
-  version_codename="${VERSION_CODENAME:-}"
-  ubuntu_codename="${UBUNTU_CODENAME:-}"
-
-  if [[ "$os_id" != "ubuntu" ]]; then
-    return 1
-  fi
-
-  if [[ -n "$version_codename" ]]; then
-    printf '%s\n' "$version_codename"
-    return 0
-  fi
-
-  if [[ -n "$ubuntu_codename" ]]; then
-    printf '%s\n' "$ubuntu_codename"
-    return 0
-  fi
-
-  return 1
-}
-
-configure_mongodb_apt_repo() {
-  local ubuntu_codename=""
-  local keyring_path="/usr/share/keyrings/mongodb-server-8.0.gpg"
-  local repo_list_path="/etc/apt/sources.list.d/mongodb-org-8.0.list"
-  local repo_line=""
-  local key_tmp="/tmp/mongodb-server-8.0.asc"
-
-  ubuntu_codename="$(detect_ubuntu_codename)" || {
-    echo "[ERROR] MongoDB auto-install currently supports Ubuntu only"
-    exit 1
-  }
-
-  case "$ubuntu_codename" in
-    noble|jammy|focal)
-      ;;
-    *)
-      echo "[ERROR] Unsupported Ubuntu release for automated MongoDB install: $ubuntu_codename"
-      exit 1
-      ;;
-  esac
-
-  echo "[DEPLOY] Configuring official MongoDB APT repo for Ubuntu $ubuntu_codename ..."
-  run_with_privilege apt-get update
-  run_with_privilege env DEBIAN_FRONTEND=noninteractive apt-get install -y curl gnupg ca-certificates
-
-  curl -fsSL https://pgp.mongodb.com/server-8.0.asc -o "$key_tmp"
-  run_with_privilege mkdir -p /usr/share/keyrings
-  run_with_privilege gpg --batch --yes -o "$keyring_path" --dearmor "$key_tmp"
-  rm -f "$key_tmp"
-
-  repo_line="deb [ arch=amd64,arm64 signed-by=$keyring_path ] https://repo.mongodb.org/apt/ubuntu $ubuntu_codename/mongodb-org/8.0 multiverse"
-  printf '%s\n' "$repo_line" | run_with_privilege tee "$repo_list_path" >/dev/null
-  run_with_privilege apt-get update
-}
-
 wait_for_local_port() {
   local host="$1"
   local port="$2"
@@ -260,37 +200,69 @@ wait_for_local_port() {
   return 1
 }
 
-ensure_mongodb_runtime() {
-  if command -v mongod >/dev/null 2>&1; then
-    echo "[DEPLOY] MongoDB runtime already installed"
-  else
-    echo "[DEPLOY] Installing MongoDB runtime ..."
-    if ! command -v apt-get >/dev/null 2>&1; then
-      echo "[ERROR] MongoDB install is only automated for apt-based systems"
-      exit 1
-    fi
+install_mongodb_binary_runtime() {
+  local tmp_dir=""
+  local archive_path=""
+  local extracted_dir=""
 
-    configure_mongodb_apt_repo
-    if ! run_with_privilege env DEBIAN_FRONTEND=noninteractive apt-get install -y mongodb-org; then
-      echo "[ERROR] Failed to install mongodb-org from the official MongoDB repository"
-      exit 1
-    fi
+  command -v wget >/dev/null 2>&1 || { echo "[ERROR] wget is required for MongoDB tarball setup"; exit 1; }
+  command -v tar >/dev/null 2>&1 || { echo "[ERROR] tar is required for MongoDB tarball setup"; exit 1; }
 
-    echo "[DEPLOY] Installed MongoDB package: mongodb-org"
+  if [[ -x "${MONGODB_INSTALL_DIR}/bin/mongod" ]]; then
+    echo "[DEPLOY] MongoDB tarball runtime already installed at ${MONGODB_INSTALL_DIR}"
+    return 0
   fi
 
-  echo "[DEPLOY] Starting MongoDB service ..."
-  if command -v systemctl >/dev/null 2>&1; then
-    run_with_privilege systemctl enable mongod || true
-    run_with_privilege systemctl start mongod || run_with_privilege systemctl start mongodb
-    run_with_privilege systemctl enable mongodb || true
-  elif command -v service >/dev/null 2>&1; then
-    run_with_privilege service mongod start || run_with_privilege service mongodb start
-  else
-    echo "[ERROR] Could not find systemctl or service to start MongoDB"
+  echo "[DEPLOY] Installing MongoDB tarball runtime ..."
+  tmp_dir="$(mktemp -d)"
+  archive_path="${tmp_dir}/${MONGODB_BINARY_NAME}.tgz"
+
+  wget -q "$MONGODB_BINARY_URL" -O "$archive_path"
+  tar -xzf "$archive_path" -C "$tmp_dir"
+  extracted_dir="$(find "$tmp_dir" -maxdepth 1 -mindepth 1 -type d -name 'mongodb-linux-*' | head -n 1)"
+
+  if [[ -z "$extracted_dir" || ! -x "${extracted_dir}/bin/mongod" ]]; then
+    rm -rf "$tmp_dir"
+    echo "[ERROR] MongoDB tarball extraction failed"
     exit 1
   fi
 
+  run_with_privilege mkdir -p /opt
+  if [[ -d "$MONGODB_INSTALL_DIR" ]]; then
+    run_with_privilege rm -rf "$MONGODB_INSTALL_DIR"
+  fi
+  run_with_privilege mv "$extracted_dir" "$MONGODB_INSTALL_DIR"
+  rm -rf "$tmp_dir"
+
+  echo "[DEPLOY] MongoDB tarball installed at ${MONGODB_INSTALL_DIR}"
+}
+
+ensure_mongodb_runtime() {
+  local mongod_bin=""
+  local owner=""
+
+  install_mongodb_binary_runtime
+  mongod_bin="${MONGODB_INSTALL_DIR}/bin/mongod"
+  owner="$(id -u):$(id -g)"
+
+  echo "[DEPLOY] Starting MongoDB service ..."
+  run_with_privilege mkdir -p "$MONGODB_DATA_DIR" "$MONGODB_LOG_DIR"
+  run_with_privilege touch "$MONGODB_LOG_FILE"
+  run_with_privilege chown -R "$owner" "$MONGODB_DATA_DIR" "$MONGODB_LOG_DIR"
+
+  if wait_for_local_port 127.0.0.1 27017 2; then
+    echo "[DEPLOY] MongoDB already listening on 127.0.0.1:27017"
+  else
+    "$mongod_bin" \
+      --fork \
+      --dbpath "$MONGODB_DATA_DIR" \
+      --logpath "$MONGODB_LOG_FILE" \
+      --bind_ip 127.0.0.1 \
+      --port 27017 \
+      --pidfilepath /tmp/mongod.pid
+  fi
+
+  export PATH="${MONGODB_INSTALL_DIR}/bin:${PATH}"
   export MONGODB_URI="${MONGODB_URI:-mongodb://127.0.0.1:27017/}"
   export DATABASE_URL="${DATABASE_URL:-$MONGODB_URI}"
 
