@@ -5,7 +5,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="per-deploy-tunnel-v3-auto-restart"
+SCRIPT_VERSION="per-deploy-tunnel-v3-auto-restart-mongodb-repo"
 AUTO_RESTART_AFTER_MINUTES="50"
 
 PROJECT_NAME=""
@@ -178,6 +178,88 @@ run_with_privilege() {
   return 1
 }
 
+detect_ubuntu_codename() {
+  if [[ ! -r /etc/os-release ]]; then
+    return 1
+  fi
+
+  local os_id=""
+  local version_codename=""
+  local ubuntu_codename=""
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  os_id="${ID:-}"
+  version_codename="${VERSION_CODENAME:-}"
+  ubuntu_codename="${UBUNTU_CODENAME:-}"
+
+  if [[ "$os_id" != "ubuntu" ]]; then
+    return 1
+  fi
+
+  if [[ -n "$version_codename" ]]; then
+    printf '%s\n' "$version_codename"
+    return 0
+  fi
+
+  if [[ -n "$ubuntu_codename" ]]; then
+    printf '%s\n' "$ubuntu_codename"
+    return 0
+  fi
+
+  return 1
+}
+
+configure_mongodb_apt_repo() {
+  local ubuntu_codename=""
+  local keyring_path="/usr/share/keyrings/mongodb-server-8.0.gpg"
+  local repo_list_path="/etc/apt/sources.list.d/mongodb-org-8.0.list"
+  local repo_line=""
+  local key_tmp="/tmp/mongodb-server-8.0.asc"
+
+  ubuntu_codename="$(detect_ubuntu_codename)" || {
+    echo "[ERROR] MongoDB auto-install currently supports Ubuntu only"
+    exit 1
+  }
+
+  case "$ubuntu_codename" in
+    noble|jammy|focal)
+      ;;
+    *)
+      echo "[ERROR] Unsupported Ubuntu release for automated MongoDB install: $ubuntu_codename"
+      exit 1
+      ;;
+  esac
+
+  echo "[DEPLOY] Configuring official MongoDB APT repo for Ubuntu $ubuntu_codename ..."
+  run_with_privilege apt-get update
+  run_with_privilege env DEBIAN_FRONTEND=noninteractive apt-get install -y curl gnupg ca-certificates
+
+  curl -fsSL https://pgp.mongodb.com/server-8.0.asc -o "$key_tmp"
+  run_with_privilege mkdir -p /usr/share/keyrings
+  run_with_privilege gpg --batch --yes -o "$keyring_path" --dearmor "$key_tmp"
+  rm -f "$key_tmp"
+
+  repo_line="deb [ arch=amd64,arm64 signed-by=$keyring_path ] https://repo.mongodb.org/apt/ubuntu $ubuntu_codename/mongodb-org/8.0 multiverse"
+  printf '%s\n' "$repo_line" | run_with_privilege tee "$repo_list_path" >/dev/null
+  run_with_privilege apt-get update
+}
+
+wait_for_local_port() {
+  local host="$1"
+  local port="$2"
+  local timeout_seconds="${3:-30}"
+  local start_seconds="$SECONDS"
+
+  while (( SECONDS - start_seconds < timeout_seconds )); do
+    if (echo > "/dev/tcp/$host/$port") >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+
+  return 1
+}
+
 ensure_mongodb_runtime() {
   if command -v mongod >/dev/null 2>&1; then
     echo "[DEPLOY] MongoDB runtime already installed"
@@ -188,30 +270,22 @@ ensure_mongodb_runtime() {
       exit 1
     fi
 
-    run_with_privilege apt-get update
-
-    local package_installed=0
-    for package_name in mongodb mongodb-server mongodb-org; do
-      if run_with_privilege env DEBIAN_FRONTEND=noninteractive apt-get install -y "$package_name"; then
-        echo "[DEPLOY] Installed MongoDB package: $package_name"
-        package_installed=1
-        break
-      fi
-    done
-
-    if [[ "$package_installed" -ne 1 ]] && ! command -v mongod >/dev/null 2>&1; then
-      echo "[ERROR] Failed to install MongoDB with available apt packages"
+    configure_mongodb_apt_repo
+    if ! run_with_privilege env DEBIAN_FRONTEND=noninteractive apt-get install -y mongodb-org; then
+      echo "[ERROR] Failed to install mongodb-org from the official MongoDB repository"
       exit 1
     fi
+
+    echo "[DEPLOY] Installed MongoDB package: mongodb-org"
   fi
 
   echo "[DEPLOY] Starting MongoDB service ..."
   if command -v systemctl >/dev/null 2>&1; then
-    run_with_privilege systemctl enable mongodb || true
-    run_with_privilege systemctl start mongodb || run_with_privilege systemctl start mongod
     run_with_privilege systemctl enable mongod || true
+    run_with_privilege systemctl start mongod || run_with_privilege systemctl start mongodb
+    run_with_privilege systemctl enable mongodb || true
   elif command -v service >/dev/null 2>&1; then
-    run_with_privilege service mongodb start || run_with_privilege service mongod start
+    run_with_privilege service mongod start || run_with_privilege service mongodb start
   else
     echo "[ERROR] Could not find systemctl or service to start MongoDB"
     exit 1
@@ -219,6 +293,12 @@ ensure_mongodb_runtime() {
 
   export MONGODB_URI="${MONGODB_URI:-mongodb://127.0.0.1:27017/}"
   export DATABASE_URL="${DATABASE_URL:-$MONGODB_URI}"
+
+  if ! wait_for_local_port 127.0.0.1 27017 30; then
+    echo "[ERROR] MongoDB service did not become ready on 127.0.0.1:27017"
+    exit 1
+  fi
+
   echo "[DEPLOY] MongoDB ready at $MONGODB_URI"
 }
 
