@@ -10,6 +10,7 @@ AUTO_RESTART_AFTER_MINUTES="50"
 
 PROJECT_NAME=""
 PROJECT_TYPE=""
+DATABASE_TYPE=""
 BUILD_CMD=""
 START_CMD=""
 PORT=""
@@ -30,6 +31,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --project-name) PROJECT_NAME="$2"; shift 2 ;;
     --type)         PROJECT_TYPE="$2"; shift 2 ;;
+    --database-type) DATABASE_TYPE="$2"; shift 2 ;;
     --build)        BUILD_CMD="$2"; shift 2 ;;
     --start)        START_CMD="$2"; shift 2 ;;
     --port)         PORT="$2"; shift 2 ;;
@@ -71,6 +73,15 @@ if [[ -n "$MISSING" ]]; then
   exit 1
 fi
 
+DATABASE_TYPE="$(printf '%s' "${DATABASE_TYPE:-none}" | tr '[:upper:]' '[:lower:]')"
+DATABASE_TYPE="${DATABASE_TYPE#"${DATABASE_TYPE%%[![:space:]]*}"}"
+DATABASE_TYPE="${DATABASE_TYPE%"${DATABASE_TYPE##*[![:space:]]}"}"
+if [[ -z "$DATABASE_TYPE" || "$DATABASE_TYPE" == "null" || "$DATABASE_TYPE" == "nil" || "$DATABASE_TYPE" == "false" || "$DATABASE_TYPE" == "off" ]]; then
+  DATABASE_TYPE="none"
+elif [[ "$DATABASE_TYPE" == "mongo" ]]; then
+  DATABASE_TYPE="mongodb"
+fi
+
 case "$PROJECT_TYPE" in
   python|node)
     ;;
@@ -87,6 +98,7 @@ echo " Deploying: $PROJECT_NAME"
 echo "=========================================="
 echo "  script    : $SCRIPT_VERSION"
 echo "  type      : $PROJECT_TYPE"
+echo "  database  : $DATABASE_TYPE"
 echo "  build     : $BUILD_CMD"
 echo "  start     : $START_CMD"
 echo "  port      : $PORT"
@@ -153,6 +165,67 @@ PY
   )
 fi
 
+run_with_privilege() {
+  if [[ "$(id -u)" -eq 0 ]]; then
+    "$@"
+    return $?
+  fi
+  if command -v sudo >/dev/null 2>&1; then
+    sudo "$@"
+    return $?
+  fi
+  echo "[ERROR] This action requires root or sudo: $*"
+  return 1
+}
+
+ensure_mongodb_runtime() {
+  if command -v mongod >/dev/null 2>&1; then
+    echo "[DEPLOY] MongoDB runtime already installed"
+  else
+    echo "[DEPLOY] Installing MongoDB runtime ..."
+    if ! command -v apt-get >/dev/null 2>&1; then
+      echo "[ERROR] MongoDB install is only automated for apt-based systems"
+      exit 1
+    fi
+
+    run_with_privilege apt-get update
+
+    local package_installed=0
+    for package_name in mongodb mongodb-server mongodb-org; do
+      if run_with_privilege env DEBIAN_FRONTEND=noninteractive apt-get install -y "$package_name"; then
+        echo "[DEPLOY] Installed MongoDB package: $package_name"
+        package_installed=1
+        break
+      fi
+    done
+
+    if [[ "$package_installed" -ne 1 ]] && ! command -v mongod >/dev/null 2>&1; then
+      echo "[ERROR] Failed to install MongoDB with available apt packages"
+      exit 1
+    fi
+  fi
+
+  echo "[DEPLOY] Starting MongoDB service ..."
+  if command -v systemctl >/dev/null 2>&1; then
+    run_with_privilege systemctl enable mongodb || true
+    run_with_privilege systemctl start mongodb || run_with_privilege systemctl start mongod
+    run_with_privilege systemctl enable mongod || true
+  elif command -v service >/dev/null 2>&1; then
+    run_with_privilege service mongodb start || run_with_privilege service mongod start
+  else
+    echo "[ERROR] Could not find systemctl or service to start MongoDB"
+    exit 1
+  fi
+
+  export MONGODB_URI="${MONGODB_URI:-mongodb://127.0.0.1:27017/}"
+  export DATABASE_URL="${DATABASE_URL:-$MONGODB_URI}"
+  echo "[DEPLOY] MongoDB ready at $MONGODB_URI"
+}
+
+if [[ "$DATABASE_TYPE" == "mongodb" ]]; then
+  ensure_mongodb_runtime
+fi
+
 echo "[DEPLOY] Preparing runtime for type: $PROJECT_TYPE ..."
 case "$PROJECT_TYPE" in
   python)
@@ -168,7 +241,7 @@ echo "[DEPLOY] Downloading cloudflared ..."
 wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O /tmp/cloudflared
 chmod +x /tmp/cloudflared
 
-export PROJECT_NAME PROJECT_TYPE BUILD_CMD START_CMD PORT HOST_NAME SERVER_ID REPO_URL BRANCH APP_DIR ENV_VARS_JSON COMMIT WORKING_COMMIT_ID AUTO_RESTART_AFTER_MINUTES
+export PROJECT_NAME PROJECT_TYPE DATABASE_TYPE BUILD_CMD START_CMD PORT HOST_NAME SERVER_ID REPO_URL BRANCH APP_DIR ENV_VARS_JSON COMMIT WORKING_COMMIT_ID AUTO_RESTART_AFTER_MINUTES
 export CF_TOKEN ZONE_ID ACCOUNT_ID TUNNEL_TOKEN SUPA_URL SUPA_KEY
 
 python3 - <<'PY'
@@ -188,6 +261,7 @@ from datetime import datetime, timezone
 
 PROJECT_NAME = os.environ["PROJECT_NAME"]
 PROJECT_TYPE = os.environ["PROJECT_TYPE"]
+DATABASE_TYPE = (os.environ.get("DATABASE_TYPE") or "none").strip()
 BUILD_CMD = os.environ["BUILD_CMD"]
 START_CMD = os.environ["START_CMD"]
 PORT = str(os.environ["PORT"])
@@ -373,6 +447,15 @@ def normalize_project_type(value: str) -> str:
     return normalized
 
 
+def normalize_database_type(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    if not normalized or normalized in {"none", "null", "nil", "false", "off"}:
+        return "none"
+    if normalized in {"mongo", "mongodb"}:
+        return "mongodb"
+    return normalized
+
+
 def pick_config_value(config: dict, key: str, fallback: str = "") -> str:
     value = (config or {}).get(key)
     if value not in (None, ""):
@@ -407,7 +490,7 @@ def load_latest_deploy_config() -> dict:
     try:
         rows = supa_request(
             "GET",
-            server_filter("id,project_name,runtime,build_command,start_command,port,host_name,repo_url,branch,env_vars"),
+            server_filter("id,project_name,runtime,database_type,build_command,start_command,port,host_name,repo_url,branch,env_vars"),
         ) or []
     except Exception as exc:
         print(f"[DEPLOY] Failed to load latest deploy config; using current command args: {exc}")
@@ -420,6 +503,7 @@ def build_redeploy_command(commit: str) -> str:
     server_id = pick_config_value(latest_config, "id", SERVER_ID)
     project_name = pick_config_value(latest_config, "project_name", PROJECT_NAME)
     project_type = normalize_project_type(pick_config_value(latest_config, "runtime", PROJECT_TYPE)) or PROJECT_TYPE
+    database_type = normalize_database_type(pick_config_value(latest_config, "database_type", DATABASE_TYPE)) or DATABASE_TYPE
     build_cmd = pick_config_value(latest_config, "build_command", BUILD_CMD)
     start_cmd = pick_config_value(latest_config, "start_command", START_CMD)
     port = pick_config_value(latest_config, "port", PORT)
@@ -435,6 +519,7 @@ def build_redeploy_command(commit: str) -> str:
         "nived-padikkal/blank-repo/main/deploy.sh | "
         f"bash -s -- --project-name {json.dumps(project_name)} "
         f"--type {json.dumps(project_type)} "
+        f"--database-type {json.dumps(database_type)} "
         f"--build {json.dumps(build_cmd)} "
         f"--start {json.dumps(start_cmd)} "
         f"--port {json.dumps(port)} "
