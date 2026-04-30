@@ -11,6 +11,11 @@ AUTO_RESTART_AFTER_MINUTES="50"
 PROJECT_NAME=""
 PROJECT_TYPE=""
 DATABASE_TYPE=""
+DATABASE_USER=""
+DATABASE_PASSWORD=""
+DATABASE_NAME=""
+DATABASE_PERMISSION="read-write"
+DATABASE_PORT=""
 BUILD_CMD=""
 START_CMD=""
 PORT=""
@@ -38,6 +43,11 @@ while [[ $# -gt 0 ]]; do
     --project-name) PROJECT_NAME="$2"; shift 2 ;;
     --type)         PROJECT_TYPE="$2"; shift 2 ;;
     --database-type) DATABASE_TYPE="$2"; shift 2 ;;
+    --database-user) DATABASE_USER="$2"; shift 2 ;;
+    --database-password) DATABASE_PASSWORD="$2"; shift 2 ;;
+    --database-name) DATABASE_NAME="$2"; shift 2 ;;
+    --database-permission) DATABASE_PERMISSION="$2"; shift 2 ;;
+    --database-port) DATABASE_PORT="$2"; shift 2 ;;
     --build)        BUILD_CMD="$2"; shift 2 ;;
     --start)        START_CMD="$2"; shift 2 ;;
     --port)         PORT="$2"; shift 2 ;;
@@ -86,7 +96,29 @@ if [[ -z "$DATABASE_TYPE" || "$DATABASE_TYPE" == "null" || "$DATABASE_TYPE" == "
   DATABASE_TYPE="none"
 elif [[ "$DATABASE_TYPE" == "mongo" ]]; then
   DATABASE_TYPE="mongodb"
+elif [[ "$DATABASE_TYPE" == "postgres" ]]; then
+  DATABASE_TYPE="postgresql"
 fi
+
+DATABASE_PERMISSION="$(printf '%s' "${DATABASE_PERMISSION:-read-write}" | tr '[:upper:]' '[:lower:]')"
+DATABASE_PERMISSION="${DATABASE_PERMISSION#"${DATABASE_PERMISSION%%[![:space:]]*}"}"
+DATABASE_PERMISSION="${DATABASE_PERMISSION%"${DATABASE_PERMISSION##*[![:space:]]}"}"
+case "$DATABASE_PERMISSION" in
+  read-write|read-only|admin) ;;
+  *) DATABASE_PERMISSION="read-write" ;;
+esac
+
+case "$DATABASE_TYPE" in
+  none) DATABASE_PORT="${DATABASE_PORT:-}" ;;
+  mongodb) DATABASE_PORT="${DATABASE_PORT:-27017}" ;;
+  postgresql) DATABASE_PORT="${DATABASE_PORT:-5432}" ;;
+  mysql) DATABASE_PORT="${DATABASE_PORT:-3306}" ;;
+  *)
+    echo "[ERROR] Unsupported database type: $DATABASE_TYPE"
+    echo "Supported databases: none, mongodb, postgresql, mysql"
+    exit 1
+    ;;
+esac
 
 case "$PROJECT_TYPE" in
   python|node)
@@ -105,6 +137,9 @@ echo "=========================================="
 echo "  script    : $SCRIPT_VERSION"
 echo "  type      : $PROJECT_TYPE"
 echo "  database  : $DATABASE_TYPE"
+[[ -n "$DATABASE_PORT" ]] && echo "  db port   : $DATABASE_PORT"
+[[ -n "$DATABASE_NAME" ]] && echo "  db name   : $DATABASE_NAME"
+[[ -n "$DATABASE_USER" ]] && echo "  db user   : $DATABASE_USER"
 echo "  build     : $BUILD_CMD"
 echo "  start     : $START_CMD"
 echo "  port      : $PORT"
@@ -171,6 +206,17 @@ PY
   )
 fi
 
+DATABASE_USER="${DATABASE_USER:-${DB_USER:-${DATABASE_USER:-}}}"
+DATABASE_PASSWORD="${DATABASE_PASSWORD:-${DB_PASSWORD:-${DATABASE_PASSWORD:-}}}"
+DATABASE_NAME="${DATABASE_NAME:-${DB_NAME:-${DATABASE_NAME:-}}}"
+DATABASE_PERMISSION="${DB_PERMISSION:-${DATABASE_PERMISSION:-read-write}}"
+DATABASE_PORT="${DB_PORT:-${DATABASE_PORT:-}}"
+DATABASE_PERMISSION="$(printf '%s' "${DATABASE_PERMISSION:-read-write}" | tr '[:upper:]' '[:lower:]')"
+case "$DATABASE_PERMISSION" in
+  read-write|read-only|admin) ;;
+  *) DATABASE_PERMISSION="read-write" ;;
+esac
+
 run_with_privilege() {
   if [[ "$(id -u)" -eq 0 ]]; then
     "$@"
@@ -182,6 +228,83 @@ run_with_privilege() {
   fi
   echo "[ERROR] This action requires root or sudo: $*"
   return 1
+}
+
+run_as_postgres() {
+  if [[ "$(id -u)" -eq 0 ]]; then
+    if command -v runuser >/dev/null 2>&1; then
+      runuser -u postgres -- "$@"
+      return $?
+    fi
+    su -s /bin/bash postgres -c "$(printf '%q ' "$@")"
+    return $?
+  fi
+  if command -v sudo >/dev/null 2>&1; then
+    sudo -u postgres "$@"
+    return $?
+  fi
+  echo "[ERROR] PostgreSQL setup requires root or sudo"
+  return 1
+}
+
+run_mysql_root() {
+  if [[ "$(id -u)" -eq 0 ]]; then
+    mysql -uroot "$@"
+    return $?
+  fi
+  if command -v sudo >/dev/null 2>&1; then
+    sudo mysql -uroot "$@"
+    return $?
+  fi
+  echo "[ERROR] MySQL setup requires root or sudo"
+  return 1
+}
+
+require_linux_package() {
+  local package_name="$1"
+  local binary_name="$2"
+
+  if command -v "$binary_name" >/dev/null 2>&1; then
+    return 0
+  fi
+  command -v apt-get >/dev/null 2>&1 || { echo "[ERROR] apt-get is required to install ${package_name}"; exit 1; }
+
+  echo "[DEPLOY] Installing ${package_name} ..."
+  run_with_privilege apt-get update -y
+  DEBIAN_FRONTEND=noninteractive run_with_privilege apt-get install -y "$package_name"
+}
+
+validate_db_identifier() {
+  local value="$1"
+  local label="$2"
+  if [[ ! "$value" =~ ^[A-Za-z_][A-Za-z0-9_]{0,62}$ ]]; then
+    echo "[ERROR] Invalid ${label}: ${value}. Use letters, numbers, and underscores; start with a letter or underscore."
+    exit 1
+  fi
+}
+
+sql_literal() {
+  DB_VALUE="$1" python3 - <<'PY'
+import os
+value = os.environ.get("DB_VALUE", "")
+print("'" + value.replace("\\", "\\\\").replace("'", "''") + "'")
+PY
+}
+
+mysql_identifier() {
+  DB_VALUE="$1" python3 - <<'PY'
+import os
+value = os.environ.get("DB_VALUE", "")
+print("`" + value.replace("`", "``") + "`")
+PY
+}
+
+url_component() {
+  DB_VALUE="$1" python3 - <<'PY'
+import os
+import urllib.parse
+print(urllib.parse.quote(os.environ.get("DB_VALUE", ""), safe=""))
+PY
 }
 
 wait_for_local_port() {
@@ -274,8 +397,179 @@ ensure_mongodb_runtime() {
   echo "[DEPLOY] MongoDB ready at $MONGODB_URI"
 }
 
+ensure_database_credentials() {
+  if [[ "$DATABASE_TYPE" != "postgresql" && "$DATABASE_TYPE" != "mysql" ]]; then
+    return 0
+  fi
+
+  DATABASE_NAME="${DATABASE_NAME:-${PROJECT_NAME//-/_}}"
+  DATABASE_USER="${DATABASE_USER:-${PROJECT_NAME//-/_}_user}"
+  DATABASE_PASSWORD="${DATABASE_PASSWORD:-$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24)}"
+
+  validate_db_identifier "$DATABASE_NAME" "database name"
+  validate_db_identifier "$DATABASE_USER" "database user name"
+}
+
+ensure_postgresql_runtime() {
+  local cluster_version=""
+  local cluster_name=""
+  local user_exists=""
+  local db_exists=""
+
+  ensure_database_credentials
+  require_linux_package postgresql psql
+
+  echo "[DEPLOY] Starting PostgreSQL service ..."
+  run_with_privilege service postgresql start || true
+
+  if command -v pg_lsclusters >/dev/null 2>&1; then
+    read -r cluster_version cluster_name _ < <(pg_lsclusters -h | awk 'NR==1 {print $1, $2, $4}')
+    if [[ -n "$cluster_version" && -n "$cluster_name" ]]; then
+      if command -v pg_conftool >/dev/null 2>&1; then
+        run_with_privilege pg_conftool "$cluster_version" "$cluster_name" set port "$DATABASE_PORT"
+      fi
+      run_with_privilege pg_ctlcluster "$cluster_version" "$cluster_name" restart || run_with_privilege service postgresql restart
+    fi
+  fi
+
+  if ! wait_for_local_port 127.0.0.1 "$DATABASE_PORT" 30; then
+    echo "[ERROR] PostgreSQL did not become ready on 127.0.0.1:${DATABASE_PORT}"
+    exit 1
+  fi
+
+  user_exists="$(run_as_postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname = $(sql_literal "$DATABASE_USER")" | tr -d '[:space:]' || true)"
+  if [[ "$user_exists" != "1" ]]; then
+    run_as_postgres psql -v ON_ERROR_STOP=1 -v db_user="$DATABASE_USER" -v db_password="$DATABASE_PASSWORD" \
+      -c "CREATE USER :\"db_user\" WITH PASSWORD :'db_password';"
+  else
+    run_as_postgres psql -v ON_ERROR_STOP=1 -v db_user="$DATABASE_USER" -v db_password="$DATABASE_PASSWORD" \
+      -c "ALTER USER :\"db_user\" WITH PASSWORD :'db_password';"
+  fi
+
+  db_exists="$(run_as_postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname = $(sql_literal "$DATABASE_NAME")" | tr -d '[:space:]' || true)"
+  if [[ "$db_exists" != "1" ]]; then
+    run_as_postgres psql -v ON_ERROR_STOP=1 -v db_name="$DATABASE_NAME" -v db_user="$DATABASE_USER" \
+      -c 'CREATE DATABASE :"db_name" OWNER :"db_user";'
+  fi
+
+  case "$DATABASE_PERMISSION" in
+    admin)
+      run_as_postgres psql -v ON_ERROR_STOP=1 -v db_user="$DATABASE_USER" -v db_name="$DATABASE_NAME" \
+        -c 'ALTER USER :"db_user" CREATEDB;' \
+        -c 'GRANT ALL PRIVILEGES ON DATABASE :"db_name" TO :"db_user";'
+      run_as_postgres psql -d "$DATABASE_NAME" -v ON_ERROR_STOP=1 -v db_user="$DATABASE_USER" \
+        -c 'GRANT ALL PRIVILEGES ON SCHEMA public TO :"db_user";' \
+        -c 'GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO :"db_user";' \
+        -c 'GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO :"db_user";'
+      ;;
+    read-only)
+      run_as_postgres psql -v ON_ERROR_STOP=1 -v db_user="$DATABASE_USER" -v db_name="$DATABASE_NAME" \
+        -c 'GRANT CONNECT ON DATABASE :"db_name" TO :"db_user";'
+      run_as_postgres psql -d "$DATABASE_NAME" -v ON_ERROR_STOP=1 -v db_user="$DATABASE_USER" \
+        -c 'GRANT USAGE ON SCHEMA public TO :"db_user";' \
+        -c 'GRANT SELECT ON ALL TABLES IN SCHEMA public TO :"db_user";' \
+        -c 'ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO :"db_user";'
+      ;;
+    *)
+      run_as_postgres psql -v ON_ERROR_STOP=1 -v db_user="$DATABASE_USER" -v db_name="$DATABASE_NAME" \
+        -c 'GRANT ALL PRIVILEGES ON DATABASE :"db_name" TO :"db_user";'
+      run_as_postgres psql -d "$DATABASE_NAME" -v ON_ERROR_STOP=1 -v db_user="$DATABASE_USER" \
+        -c 'GRANT USAGE, CREATE ON SCHEMA public TO :"db_user";' \
+        -c 'GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO :"db_user";' \
+        -c 'GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO :"db_user";' \
+        -c 'ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO :"db_user";' \
+        -c 'ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO :"db_user";'
+      ;;
+  esac
+
+  export DB_HOST="${DB_HOST:-127.0.0.1}"
+  export DB_PORT="$DATABASE_PORT"
+  export DB_NAME="$DATABASE_NAME"
+  export DB_USER="$DATABASE_USER"
+  export DB_PASSWORD="$DATABASE_PASSWORD"
+  export POSTGRES_HOST="$DB_HOST"
+  export POSTGRES_PORT="$DB_PORT"
+  export POSTGRES_DB="$DB_NAME"
+  export POSTGRES_USER="$DB_USER"
+  export POSTGRES_PASSWORD="$DB_PASSWORD"
+  export DATABASE_URL="${DATABASE_URL:-postgresql://$(url_component "$DB_USER"):$(url_component "$DB_PASSWORD")@${DB_HOST}:${DB_PORT}/$(url_component "$DB_NAME")}"
+
+  echo "[DEPLOY] PostgreSQL ready at ${DB_HOST}:${DB_PORT}/${DB_NAME}"
+}
+
+ensure_mysql_runtime() {
+  local db_identifier=""
+  local user_literal=""
+  local password_literal=""
+
+  ensure_database_credentials
+  require_linux_package mysql-server mysql
+
+  echo "[DEPLOY] Starting MySQL service ..."
+  run_with_privilege service mysql start || run_with_privilege service mysqld start || true
+
+  if [[ -f /etc/mysql/mysql.conf.d/mysqld.cnf ]]; then
+    run_with_privilege sed -i -E "s/^[#[:space:]]*port[[:space:]]*=.*/port = ${DATABASE_PORT}/" /etc/mysql/mysql.conf.d/mysqld.cnf
+    if ! grep -Eq "^[[:space:]]*port[[:space:]]*=" /etc/mysql/mysql.conf.d/mysqld.cnf; then
+      printf '\nport = %s\n' "$DATABASE_PORT" | run_with_privilege tee -a /etc/mysql/mysql.conf.d/mysqld.cnf >/dev/null
+    fi
+    run_with_privilege service mysql restart || run_with_privilege service mysqld restart || true
+  fi
+
+  if ! wait_for_local_port 127.0.0.1 "$DATABASE_PORT" 30; then
+    echo "[ERROR] MySQL did not become ready on 127.0.0.1:${DATABASE_PORT}"
+    exit 1
+  fi
+
+  db_identifier="$(mysql_identifier "$DATABASE_NAME")"
+  user_literal="$(sql_literal "$DATABASE_USER")"
+  password_literal="$(sql_literal "$DATABASE_PASSWORD")"
+
+  run_mysql_root <<SQL
+CREATE DATABASE IF NOT EXISTS ${db_identifier};
+CREATE USER IF NOT EXISTS ${user_literal}@'localhost' IDENTIFIED BY ${password_literal};
+CREATE USER IF NOT EXISTS ${user_literal}@'127.0.0.1' IDENTIFIED BY ${password_literal};
+ALTER USER ${user_literal}@'localhost' IDENTIFIED BY ${password_literal};
+ALTER USER ${user_literal}@'127.0.0.1' IDENTIFIED BY ${password_literal};
+SQL
+
+  case "$DATABASE_PERMISSION" in
+    admin)
+      run_mysql_root -e "GRANT ALL PRIVILEGES ON *.* TO ${user_literal}@'localhost' WITH GRANT OPTION;"
+      run_mysql_root -e "GRANT ALL PRIVILEGES ON *.* TO ${user_literal}@'127.0.0.1' WITH GRANT OPTION;"
+      ;;
+    read-only)
+      run_mysql_root -e "GRANT SELECT ON ${db_identifier}.* TO ${user_literal}@'localhost';"
+      run_mysql_root -e "GRANT SELECT ON ${db_identifier}.* TO ${user_literal}@'127.0.0.1';"
+      ;;
+    *)
+      run_mysql_root -e "GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX, DROP ON ${db_identifier}.* TO ${user_literal}@'localhost';"
+      run_mysql_root -e "GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX, DROP ON ${db_identifier}.* TO ${user_literal}@'127.0.0.1';"
+      ;;
+  esac
+  run_mysql_root -e "FLUSH PRIVILEGES;"
+
+  export DB_HOST="${DB_HOST:-127.0.0.1}"
+  export DB_PORT="$DATABASE_PORT"
+  export DB_NAME="$DATABASE_NAME"
+  export DB_USER="$DATABASE_USER"
+  export DB_PASSWORD="$DATABASE_PASSWORD"
+  export MYSQL_HOST="$DB_HOST"
+  export MYSQL_PORT="$DB_PORT"
+  export MYSQL_DATABASE="$DB_NAME"
+  export MYSQL_USER="$DB_USER"
+  export MYSQL_PASSWORD="$DB_PASSWORD"
+  export DATABASE_URL="${DATABASE_URL:-mysql://$(url_component "$DB_USER"):$(url_component "$DB_PASSWORD")@${DB_HOST}:${DB_PORT}/$(url_component "$DB_NAME")}"
+
+  echo "[DEPLOY] MySQL ready at ${DB_HOST}:${DB_PORT}/${DB_NAME}"
+}
+
 if [[ "$DATABASE_TYPE" == "mongodb" ]]; then
   ensure_mongodb_runtime
+elif [[ "$DATABASE_TYPE" == "postgresql" ]]; then
+  ensure_postgresql_runtime
+elif [[ "$DATABASE_TYPE" == "mysql" ]]; then
+  ensure_mysql_runtime
 fi
 
 echo "[DEPLOY] Preparing runtime for type: $PROJECT_TYPE ..."
@@ -293,7 +587,7 @@ echo "[DEPLOY] Downloading cloudflared ..."
 wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O /tmp/cloudflared
 chmod +x /tmp/cloudflared
 
-export PROJECT_NAME PROJECT_TYPE DATABASE_TYPE BUILD_CMD START_CMD PORT HOST_NAME SERVER_ID REPO_URL BRANCH APP_DIR ENV_VARS_JSON COMMIT WORKING_COMMIT_ID AUTO_RESTART_AFTER_MINUTES
+export PROJECT_NAME PROJECT_TYPE DATABASE_TYPE DATABASE_USER DATABASE_PASSWORD DATABASE_NAME DATABASE_PERMISSION DATABASE_PORT BUILD_CMD START_CMD PORT HOST_NAME SERVER_ID REPO_URL BRANCH APP_DIR ENV_VARS_JSON COMMIT WORKING_COMMIT_ID AUTO_RESTART_AFTER_MINUTES
 export CF_TOKEN ZONE_ID ACCOUNT_ID TUNNEL_TOKEN SUPA_URL SUPA_KEY
 
 python3 - <<'PY'
@@ -314,6 +608,11 @@ from datetime import datetime, timezone
 PROJECT_NAME = os.environ["PROJECT_NAME"]
 PROJECT_TYPE = os.environ["PROJECT_TYPE"]
 DATABASE_TYPE = (os.environ.get("DATABASE_TYPE") or "none").strip()
+DATABASE_USER = (os.environ.get("DATABASE_USER") or "").strip()
+DATABASE_PASSWORD = (os.environ.get("DATABASE_PASSWORD") or "").strip()
+DATABASE_NAME = (os.environ.get("DATABASE_NAME") or "").strip()
+DATABASE_PERMISSION = (os.environ.get("DATABASE_PERMISSION") or "read-write").strip()
+DATABASE_PORT = (os.environ.get("DATABASE_PORT") or "").strip()
 BUILD_CMD = os.environ["BUILD_CMD"]
 START_CMD = os.environ["START_CMD"]
 PORT = str(os.environ["PORT"])
@@ -542,7 +841,7 @@ def load_latest_deploy_config() -> dict:
     try:
         rows = supa_request(
             "GET",
-            server_filter("id,project_name,runtime,database_type,build_command,start_command,port,host_name,repo_url,branch,env_vars"),
+            server_filter("id,project_name,runtime,database_type,database_user,database_password,database_name,database_permission,database_port,build_command,start_command,port,host_name,repo_url,branch,env_vars"),
         ) or []
     except Exception as exc:
         print(f"[DEPLOY] Failed to load latest deploy config; using current command args: {exc}")
@@ -556,6 +855,11 @@ def build_redeploy_command(commit: str) -> str:
     project_name = pick_config_value(latest_config, "project_name", PROJECT_NAME)
     project_type = normalize_project_type(pick_config_value(latest_config, "runtime", PROJECT_TYPE)) or PROJECT_TYPE
     database_type = normalize_database_type(pick_config_value(latest_config, "database_type", DATABASE_TYPE)) or DATABASE_TYPE
+    database_user = pick_config_value(latest_config, "database_user", DATABASE_USER)
+    database_password = pick_config_value(latest_config, "database_password", DATABASE_PASSWORD)
+    database_name = pick_config_value(latest_config, "database_name", DATABASE_NAME)
+    database_permission = pick_config_value(latest_config, "database_permission", DATABASE_PERMISSION)
+    database_port = pick_config_value(latest_config, "database_port", DATABASE_PORT)
     build_cmd = pick_config_value(latest_config, "build_command", BUILD_CMD)
     start_cmd = pick_config_value(latest_config, "start_command", START_CMD)
     port = pick_config_value(latest_config, "port", PORT)
@@ -584,6 +888,16 @@ def build_redeploy_command(commit: str) -> str:
         command += f" --branch {json.dumps(branch)}"
     if commit:
         command += f" --commit {json.dumps(commit)}"
+    if database_user and database_type in {"postgresql", "mysql"}:
+        command += f" --database-user {json.dumps(database_user)}"
+    if database_password and database_type in {"postgresql", "mysql"}:
+        command += f" --database-password {json.dumps(database_password)}"
+    if database_name and database_type in {"postgresql", "mysql"}:
+        command += f" --database-name {json.dumps(database_name)}"
+    if database_permission and database_type in {"postgresql", "mysql"}:
+        command += f" --database-permission {json.dumps(database_permission)}"
+    if database_port:
+        command += f" --database-port {json.dumps(database_port)}"
     if env_vars_json and env_vars_json != "[]":
         command += f" --env-vars {json.dumps(env_vars_json)}"
     command += f" --cf-token {json.dumps(CF_TOKEN)}"
